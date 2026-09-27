@@ -25,7 +25,7 @@ resumes where it left off):
 Standard library only; each stage runs in the environment it needs
 (.venv-recon, .venv-sam3). Logs go to work/<name>/import.log. Expect about
 two hours on an RTX 4090 for a few hundred frames; other GPU work slows it a
-lot (--wait-for-gpu waits for the GPU to be idle first).
+lot (--wait-for-gpu first waits until the GPU has about 13 GB free).
 """
 
 import argparse
@@ -100,15 +100,19 @@ def probe_fps(video):
     return float(num) / float(den)
 
 
-def wait_for_gpu(imp, idle_percent=20, minutes=3):
-    imp.say(f"waiting for the GPU to be idle (utilisation under {idle_percent}% for {minutes} min)")
+def wait_for_gpu(imp, free_gb=13, busy_percent=70, minutes=3):
+    """Wait until the GPU has room: the fill passes need about 12 GB, and
+    sharing memory with another heavy job makes Windows page it, which is what
+    slows everything down. A browser tab drawing something is fine."""
+    imp.say(f"waiting for {free_gb} GB of free GPU memory and utilisation under {busy_percent}% for {minutes} min")
     quiet = 0
     while quiet < minutes * 2:
-        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-                             capture_output=True, text=True).stdout.strip() or "100"
-        quiet = quiet + 1 if int(out.splitlines()[0]) < idle_percent else 0
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free,utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True).stdout.strip() or "0, 100"
+        free_mb, util = (int(x) for x in out.splitlines()[0].split(","))
+        quiet = quiet + 1 if free_mb >= free_gb * 1024 and util < busy_percent else 0
         time.sleep(30)
-    imp.say("GPU idle")
+    imp.say("GPU has room")
 
 
 def scene_meta(name):
@@ -124,7 +128,7 @@ def main():
     ap.add_argument("--objects", nargs="*", default=DEFAULT_OBJECTS, help="object prompts to scan for")
     ap.add_argument("--no-objects", action="store_true")
     ap.add_argument("--force", action="store_true", help="continue even if the pre-flight check says it won't work")
-    ap.add_argument("--wait-for-gpu", action="store_true", help="wait until the GPU is idle before heavy stages")
+    ap.add_argument("--wait-for-gpu", action="store_true", help="wait until the GPU has room before the heavy stages")
     args = ap.parse_args()
 
     if not re.fullmatch(r"[A-Za-z0-9_]+", args.name):
