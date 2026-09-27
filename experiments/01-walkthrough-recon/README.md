@@ -64,6 +64,40 @@ python experiments/01-walkthrough-recon/scan_objects.py --scene house-filled2 --
 
 The worker binds to 127.0.0.1 and only accepts the viewer's origin. `test_gpu_worker.py` checks image quality, timing, the origin check and latest-wins behaviour.
 
+## Import your own walkthrough (one command)
+
+After the setup above (and `.venv-sam3` for objects and the people check):
+
+```bash
+.venv-recon/Scripts/python.exe experiments/01-walkthrough-recon/import_walkthrough.py --name loft path/to/walkthrough.mp4 --wait-for-gpu
+```
+
+It runs every stage with the settings that worked on the house, logs to `work/<name>/import.log`, and resumes where it stopped if interrupted:
+
+1. Pre-flight check (`preflight.py`).
+2. Camera solve and splat training (`reconstruct.py`, about 7.5 frames per second of video).
+3. Walls (`free_space.py`).
+4. Three fill passes (`complete_difix.py` + `package_filled.py`).
+5. Objects (`scan_objects.py`).
+6. A before/after free-roam flythrough (`roam_flythrough.py`).
+7. `work/<name>/import_report.json` and the link to `?scene=<name>-roam/`.
+
+Several videos of one place can be passed together. Clips that share no views with the rest are reported and left out.
+
+**Pre-flight check.** From frames sampled twice a second, it measures:
+- **Movement:** whether the camera moves or only turns. It matches features between neighbouring samples; a homography explains a turning camera almost exactly, while a walking camera leaves parallax.
+- **Blur, exposure, plain surfaces, cuts.**
+- **People,** with SAM 3.
+
+It stops on footage that can't work (under 4 s, under 1280 px wide, too dark, or a camera that moves in under 30% of the video) unless `--force`, and warns about the rest. The house clip 7578547 passes cleanly.
+
+**What makes footage work:**
+- nothing moving in the scene;
+- walking through the space rather than standing and panning;
+- sharp, well-lit frames, ideally 4K;
+- one steady lens with no zooming;
+- clips that overlap if there are several.
+
 ## Results: kitchen (clip 7578540)
 
 Machine: Windows 10, RTX 4090 (24 GB), 16 cores, 62 GB RAM.

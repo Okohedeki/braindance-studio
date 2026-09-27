@@ -61,7 +61,7 @@ This is the experience the project exists to deliver. Each step notes where its 
 | Infer feature | Optional plugin, not in the core. HY-World 2.0 is a test backend only because of its license; the default should be permissively licensed |
 | Platform | Windows first. macOS and Linux marked untested until verified |
 | Rendering | Two renderers on one timeline: GPU mode streams frames from a local gsplat worker (reference quality, about 55–60 fps at 1080p on the 4090); browser mode (Spark) is the fallback with no worker. Chosen 2026-09-24 after measuring Spark about 6 dB below the reference renderer |
-| Walkthrough video | Experiment 01 shows a walkthrough of a still space can be rebuilt and explored (Pexels clips). Open: whether importing your own walkthrough becomes a feature. If it does, shots that don't connect are reported and left out, never silently merged |
+| Walkthrough video | Experiment 01 shows a walkthrough of a still space can be rebuilt and explored (Pexels clips). Importing a walkthrough video is a feature (chosen 2026-09-27): `import_walkthrough.py` runs every stage in one command, a pre-flight check reports footage that won't work before hours of compute, and shots that don't connect are reported and left out, never silently merged |
 | Name | Choose an original name before the repo goes public |
 
 ## Not in scope
