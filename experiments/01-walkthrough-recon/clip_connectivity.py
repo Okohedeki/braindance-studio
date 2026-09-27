@@ -100,6 +100,7 @@ def check(colmap, model_dir, out_dir, report_path):
         "dropped": dropped,
     }
     if not dropped:
+        report["model"] = str(model_dir)
         Path(report_path).write_text(json.dumps(report, indent=1))
         return Path(model_dir), report
     out_dir = Path(out_dir)
@@ -111,5 +112,6 @@ def check(colmap, model_dir, out_dir, report_path):
                    check=True, capture_output=True)
     kept_centres = np.array([c for n, _, c in images if clip_of(n) in kept])
     report["rescale"] = rescale(colmap, out_dir, kept_centres)
+    report["model"] = str(out_dir)
     Path(report_path).write_text(json.dumps(report, indent=1))
     return out_dir, report

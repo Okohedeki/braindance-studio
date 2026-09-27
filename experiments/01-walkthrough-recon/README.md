@@ -275,3 +275,46 @@ Playback videos (recorded | render): `work/captures/kitchen_browser_vs_gpu.mp4`,
 Quality is lower than the single kitchen clip (28.4 vs 34.5 dB) because there are fewer frames per metre of path, a larger space, and exposure and flare changes between shots.
 
 **v2 training (MCMC, anti-aliased, pose refinement; now the default):** held-out PSNR 28.4 → 31.6 dB, SSIM 0.938 → 0.953, LPIPS 0.188 → 0.119; 1M splats, 1.7 GB peak, 17 min. Median per-frame PSNR rose to 33.0 (hallway), 35.0 (living) and 30.2 (dining), and frames the model couldn't fit fell from 48 to 2, including the mirror hallway. Viewer packages: `viewer/house` (v2), `viewer/house-v1`; likewise `viewer/kitchen` (v2) and `viewer/kitchen-v1`.
+
+## Results: courtyard house (a harder video, imported in one command)
+
+Pexels 10959786, "Showcase of house" by Abdullah | 4K (Pexels license): one continuous 27 s take in 4K at 30 fps. It goes from an outdoor terrace through a courtyard and a glass sliding door into the living area, up an LED-lit staircase, along an upstairs hallway and into a bedroom. It was chosen to be harder than the Kindel Media house: outdoors and indoors, two floors, bright sun then dim interiors, plain walls and fast turns. `import_walkthrough.py --name courtyard` built it (`viewer/courtyard-roam`).
+
+**Pre-flight check.** Passed with warnings:
+- 22% of the video looks at plain surfaces;
+- 22% of frames are blurry;
+- 6 moments are cuts or very fast turns.
+
+**Camera solve: SIFT broke it into pieces.** At 7.5 frames/s, SIFT joined only 91 of 205 frames into one piece: 0–12 s, outside to the door. Five pieces in all; the solve broke in two places:
+- **The stairwell,** where frames had 130–850 features instead of 2,000+ and the chain of matches broke.
+- **A blank wall** at 21 s (68–169 features).
+
+What was tried:
+
+| Attempt | Largest piece | Notes |
+|---|---|---|
+| SIFT, 7.5 frames/s | 91 of 205 (44%) | Matching every pair against every other found no links across the gaps |
+| SIFT, 15 frames/s, peak threshold 0.002, overlap 25, relaxed solver | 241 of 410 (59%) | Up the stairs; upstairs still separate |
+| ALIKED + LightGlue, 15 frames/s, overlap 25, relaxed solver | **406 of 410 (99%)** | The whole video; 4 frames of blank wall left out |
+
+ALIKED extraction takes 27 s; LightGlue matching 15 min (SIFT: about 1 min). COLMAP runs both on ONNX Runtime, whose CUDA provider needs cuDNN 9: COLMAP's Windows build lacks it, so `reconstruct.py` puts PyTorch's `torch/lib` on the path. The importer now does this on its own: SIFT first, then the ALIKED retry if under 90% of frames join.
+
+**Numbers:**
+- **Training:** held-out PSNR 25.2 dB, SSIM 0.90, 1M splats (house: 31.6 dB). Sky, sun, exposure swings and a larger two-floor space.
+- **Fill passes:** held-out PSNR at half resolution 27.9 → 28.3 → 28.5 → 28.1 dB (8.9, 16.4 and 25.2 min). The fills also clean up playback from the recording cameras.
+- **Free-roam probe repair distance:** 0.057 → 0.051 (house: 0.043 → 0.038).
+
+**Side by side** (`work/captures/courtyard_roam_compare.mp4`, `courtyard_playback.jpg`):
+- **Playback from the recording camera:** the terrace and courtyard are near-photographic. On the LED staircase a large smear in the unfilled scene is gone after filling. The upstairs room improves a lot but stays soft.
+- **Free roam outdoors:** shards become clean paving, planters and walls.
+- **Free roam indoors:** mostly soft. The stairwell and upstairs hallway are narrow, and free-roam views end up close to plain walls the video only passed.
+- **Sky:** black in views facing up. Nothing that far away gets reconstructed.
+
+**Objects:** 39 (21 plants, 6 chairs, 6 tables, 3 sofas, 2 lamps, 1 bed). Tracking took 16 min; "plant" alone took 8.5 min at 17.8 GB, because there are so many plants.
+
+**Time on the 4090:** about 2 hours of compute (solve about 20, training 20, fills 50, objects 17 min), not counting the failed SIFT attempts and waits for the GPU.
+
+**What would help next:**
+- A sky model (a background colour or environment map fitted to the frames), so outdoor views don't show black.
+- A higher splat cap for a scene this size (1M now).
+- For narrow interiors, keeping free-roam views further from walls, or letting the viewer's walls stop the camera closer to the path there.

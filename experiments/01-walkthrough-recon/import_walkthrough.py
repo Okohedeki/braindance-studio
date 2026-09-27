@@ -135,6 +135,14 @@ def clear_solve(work):
             (work / f).unlink()
 
 
+def stage_minutes(log_path):
+    """Minutes per stage from the log, so resumed imports report every stage."""
+    minutes = {}
+    for m in re.finditer(r"\] (\d+/10 [^:\n]+): done in ([\d.]+) min", log_path.read_text(encoding="utf-8")):
+        minutes[m.group(1)] = float(m.group(2))
+    return minutes
+
+
 def scene_meta(name):
     p = HERE / "viewer" / name / "scene.json"
     return json.loads(p.read_text()) if p.exists() else None
@@ -296,7 +304,7 @@ def main():
         "heldOutPSNR": {k: (v.get("final") or v["stages"][-1])["heldOutPSNR"] for k, v in fill_logs.items()},
         "probeRepairDistance": {"before": fill_logs.get("fill3", {}).get("probesBefore"),
                                 "after": fill_logs.get("fill3", {}).get("probesAfter")},
-        "objects": meta.get("objects", {}).get("count"), "minutes": imp.timings,
+        "objects": meta.get("objects", {}).get("count"), "minutes": stage_minutes(imp.log_path),
         "viewer": f"http://localhost:8790/?scene={final}/",
     }
     (work / "import_report.json").write_text(json.dumps(report, indent=1))

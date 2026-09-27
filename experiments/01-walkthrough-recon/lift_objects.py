@@ -76,6 +76,19 @@ def read_clip_cameras(model_dir):
     return {clip: cams[cam_id] for clip, cam_id in by_clip.items()}
 
 
+def solved_model(work):
+    """The (lens-distorted) COLMAP model the scene was trained from: the one
+    the connectivity check recorded, else the largest piece of the solve (the
+    rule reconstruct.py uses)."""
+    report = work / "connectivity.json"
+    if report.exists() and "model" in (r := json.loads(report.read_text())):
+        return Path(r["model"])
+    if (work / "sparse_connected" / "cameras.bin").exists():
+        return work / "sparse_connected"
+    models = [p for p in (work / "sparse").iterdir() if (p / "images.bin").exists()]
+    return max(models, key=lambda p: (p / "images.bin").stat().st_size)
+
+
 def distort(cam, xn, yn):
     """Normalised camera coordinates -> pixel coordinates in the original frame
     (COLMAP convention: pixel i covers [i, i + 1))."""
@@ -179,7 +192,7 @@ def main():
     s = load_splats(pkg / "scene.ply")
     n = s["means"].shape[0]
     means = s["means"]
-    lens = read_clip_cameras(work / "sparse_connected")
+    lens = read_clip_cameras(solved_model(work))
 
     tracks = []  # candidate objects: one per (clip, prompt, tracked id)
     for ci, clip in enumerate(clips):
