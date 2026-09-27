@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -115,6 +116,25 @@ def wait_for_gpu(imp, free_gb=13, busy_percent=70, minutes=3):
     imp.say("GPU has room")
 
 
+SOLVE_TARGET = 0.9  # share of extracted frames that must join into one piece before training
+
+
+def registered_frames(model):
+    """Number of frames in a COLMAP binary model."""
+    with open(model / "images.bin", "rb") as f:
+        return struct.unpack("<Q", f.read(8))[0]
+
+
+def clear_solve(work):
+    """Remove one camera-solve attempt (frames, features, pieces) before the next."""
+    for sub in ("images", "sparse", "sparse_connected", "train"):
+        if (work / sub).exists():
+            shutil.rmtree(work / sub)
+    for f in ("database.db", "connectivity.json"):
+        if (work / f).exists():
+            (work / f).unlink()
+
+
 def scene_meta(name):
     p = HERE / "viewer" / name / "scene.json"
     return json.loads(p.read_text()) if p.exists() else None
@@ -181,15 +201,44 @@ def main():
     if args.wait_for_gpu:
         wait_for_gpu(imp)
 
-    # 3. build
+    # 3. build: camera solve first, checked before hours of training go into it
     fps = probe_fps(videos[0])
     frame_step = max(1, round(fps / FRAMES_PER_SECOND))
+    matcher = "exhaustive" if len(clips) > 1 else "sequential"
+    attempts = [
+        {"label": f"SIFT, {fps / frame_step:.1f} frames/s", "frame_step": frame_step, "options": []},
+        # Hard footage (plain walls, fast turns, lighting changes): twice the frames and learned
+        # features. Joined the whole courtyard video where SIFT kept only 44% of it.
+        {"label": f"ALIKED + LightGlue, {fps / max(1, frame_step // 2):.1f} frames/s",
+         "frame_step": max(1, frame_step // 2),
+         "options": ["--features", "aliked", "--overlap", 25, "--relaxed"]},
+    ]
+    solve_path = work / "solve.json"
+
+    def solve():
+        tried = []
+        for i, a in enumerate(attempts):
+            if i:
+                imp.say(f"  only {tried[-1]['share']:.0%} of frames joined; trying again with {a['label']}")
+                clear_solve(work)
+            imp.run(HERE / "reconstruct.py", "--scene", name, "--clips", *clips, "--frame-step", a["frame_step"],
+                    "--source-fps", fps, "--matcher", matcher, "--source", credit, *a["options"], "--solve-only")
+            placed = registered_frames(work / "train" / "sparse" / "0")
+            extracted = sum(1 for _ in (work / "images").rglob("*.jpg"))
+            tried.append({**a, "registered": placed, "extracted": extracted, "share": placed / max(extracted, 1)})
+            imp.say(f"  {a['label']}: {placed} of {extracted} frames joined in one piece")
+            if tried[-1]["share"] >= SOLVE_TARGET:
+                break
+        solve_path.write_text(json.dumps({"chosen": tried[-1], "attempts": tried}, indent=1, default=str))
+
+    imp.stage("solve", "3/10 camera solve", solve_path.exists, solve)
+    chosen = json.loads(solve_path.read_text())["chosen"]
     base_ckpt = work / "run" / "ckpts" / "ckpt_29999_rank0.pt"
-    imp.stage("build", "3/10 camera solve, splat training, export",
+    imp.stage("build", "3/10 splat training and export",
               lambda: base_ckpt.exists() and scene_meta(name) is not None,
-              lambda: imp.run(HERE / "reconstruct.py", "--scene", name, "--clips", *clips, "--frame-step", frame_step,
-                              "--source-fps", fps, "--matcher", "exhaustive" if len(clips) > 1 else "sequential",
-                              "--source", credit))
+              lambda: imp.run(HERE / "reconstruct.py", "--scene", name, "--clips", *clips,
+                              "--frame-step", chosen["frame_step"], "--source-fps", fps, "--matcher", matcher,
+                              "--source", credit, *chosen["options"]))
     connectivity = json.loads((work / "connectivity.json").read_text())
     if connectivity.get("dropped"):
         imp.say(f"  clips {connectivity['dropped']} share no views with the rest and were left out")
