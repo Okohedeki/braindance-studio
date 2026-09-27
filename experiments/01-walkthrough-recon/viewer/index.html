@@ -1,0 +1,1151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Walkthrough Viewer</title>
+<style>
+  :root {
+    --bg: #0e1013; --panel: #15181c; --panel-2: #1b1f24; --line: #272c33;
+    --text: #e6e8eb; --muted: #9aa1ab; --cyan: #33c6e5; --amber: #f5a833; --red: #e5484d;
+    --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+    --radius: 6px;
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+  body { display: grid; grid-template-rows: auto 1fr auto; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  header { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-2) var(--space-4);
+    border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 13px; font-weight: 600; margin: 0; }
+  header .src { color: var(--muted); }
+  header .stats { margin-left: auto; color: var(--muted); }
+
+  #stage { position: relative; overflow: hidden; min-height: 0; }
+  #stage canvas { display: block; width: 100%; height: 100%; outline: none; }
+  #stage canvas#gl { position: relative; z-index: 1; }
+  #gpuView { position: absolute; inset: 0; visibility: hidden; }
+  #viewBadge, #panel, #inset, #toast, #error { z-index: 2; }
+  .gpu-status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .gpu-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .gpu-status.on::before { background: var(--cyan); }
+
+  .badge { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 999px;
+    background: rgba(14,16,19,.8); border: 1px solid var(--line); font-size: 12px; }
+  .badge::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--dot, var(--muted)); }
+  .badge.recorded { --dot: var(--amber); }
+  .badge.reconstructed { --dot: var(--cyan); }
+  #viewBadge { position: absolute; top: var(--space-3); left: 50%; transform: translateX(-50%); }
+
+  #panel { position: absolute; top: var(--space-3); left: var(--space-3); width: 220px; padding: var(--space-3);
+    background: rgba(21,24,28,.92); border: 1px solid var(--line); border-radius: var(--radius);
+    display: grid; gap: var(--space-3); }
+  #panel h2 { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0 0 var(--space-1); }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; }
+  .seg button[aria-pressed="true"] { background: var(--panel-2); color: var(--text); box-shadow: inset 0 -2px 0 var(--cyan); }
+  button { font: inherit; color: var(--text); background: transparent; border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 5px 10px; cursor: pointer; }
+  button:hover { background: var(--panel-2); }
+  button:focus-visible, input:focus-visible { outline: 2px solid var(--cyan); outline-offset: 1px; }
+  label.check { display: flex; align-items: center; gap: var(--space-2); cursor: pointer; }
+  .hint { color: var(--muted); font-size: 12px; margin: 0; }
+  #legend { display: none; gap: var(--space-1); }
+  #legend.on { display: grid; }
+  .ramp { height: 8px; border-radius: 4px; background: linear-gradient(90deg, var(--amber), var(--cyan)); }
+  .ramp-labels { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  .unseen { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; }
+  .unseen i { width: 10px; height: 10px; border-radius: 2px; background: var(--red); }
+
+  #inset { position: absolute; top: var(--space-3); right: var(--space-3); width: min(320px, 38vw); margin: 0;
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  #inset img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: #000; }
+  #inset figcaption { display: flex; align-items: center; gap: var(--space-2); padding: 6px var(--space-2); color: var(--muted); font-size: 12px; }
+  #heldOut { color: var(--cyan); display: none; }
+
+  #toast { position: absolute; left: 50%; bottom: var(--space-3); transform: translateX(-50%); color: var(--muted);
+    background: rgba(14,16,19,.85); padding: 4px 10px; border-radius: var(--radius); font-size: 12px; }
+
+  footer { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-2) var(--space-4);
+    border-top: 1px solid var(--line); background: var(--panel); }
+  footer input[type=range] { flex: 1; accent-color: var(--cyan); }
+  #timecode { min-width: 150px; text-align: right; color: var(--muted); }
+  #play { min-width: 64px; }
+
+  #error { display: none; position: absolute; inset: 0; place-items: center; text-align: center; color: var(--muted); padding: var(--space-4); }
+
+  [hidden] { display: none !important; }
+  #panel { max-height: calc(100% - 2 * var(--space-3)); overflow-x: hidden; overflow-y: auto;
+    grid-template-columns: minmax(0, 1fr); }
+  #panel .hint { overflow-wrap: anywhere; }
+  #objectList { list-style: none; margin: 0 0 var(--space-2); padding: 0; max-height: 220px; overflow-y: auto; }
+  #objectList:empty { display: none; }
+  #objectList .objgroup { color: var(--muted); font-size: 11px; padding: 6px 2px 2px; }
+  #objectList button { width: 100%; display: flex; align-items: center; gap: 6px; padding: 3px 6px; border: 0; text-align: left; }
+  #objectList button[aria-pressed="true"] { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--cyan); }
+  #objectList i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  #objectList .time { margin-left: auto; color: var(--muted); font-size: 11px; }
+  #scanForm { display: flex; gap: var(--space-1); margin-top: var(--space-2); }
+  #scanForm input { flex: 1; width: 0; min-width: 0; font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 4px 8px; }
+  #objectsHint { margin-top: var(--space-2); }
+  #objTags { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 2; }
+  .objtag { position: absolute; left: 0; top: 0; pointer-events: auto; padding: 1px 7px; font-size: 11px;
+    border-radius: 999px; background: rgba(14,16,19,.8); border: 1px solid var(--c); white-space: nowrap; }
+  .objtag:hover { background: rgba(27,31,36,.95); }
+  .objtag.focus { background: var(--c); color: #0e1013; font-weight: 600; }
+  #inset .frame { position: relative; }
+  #insetMask { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+
+  @media (max-width: 720px) {
+    #panel { width: auto; right: var(--space-3); top: auto; bottom: var(--space-3); grid-template-columns: 1fr 1fr; }
+    #inset { width: 44vw; }
+    #timecode { min-width: 0; }
+  }
+</style>
+<script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/2.2.0/spark.module.js"
+    }
+  }
+</script>
+</head>
+<body>
+<header>
+  <h1>Experiment 01 · Walkthrough reconstruction</h1>
+  <span class="src" id="source"></span>
+  <span class="stats num" id="stats"></span>
+  <span class="gpu-status num" id="gpuStatus">GPU worker offline</span>
+</header>
+
+<main id="stage">
+  <span class="badge reconstructed" id="viewBadge">Reconstructed</span>
+  <div id="objTags"></div>
+
+  <section id="panel" aria-label="View controls">
+    <div>
+      <h2>Renderer</h2>
+      <div class="seg" role="group" aria-label="Renderer">
+        <button id="localBtn" aria-pressed="false" title="Render in the browser with Spark (works without a GPU worker)">Local</button>
+        <button id="gpuBtn" aria-pressed="true" title="Render with gsplat on the local GPU worker (G)">GPU</button>
+      </div>
+      <p class="hint" id="rendererHint"></p>
+    </div>
+    <div>
+      <h2>Camera</h2>
+      <div class="seg" role="group" aria-label="Camera mode">
+        <button id="lockBtn" aria-pressed="true" title="Follow the recording camera (L)">Source</button>
+        <button id="freeBtn" aria-pressed="false" title="Move freely; time keeps its own position (L)">Free</button>
+      </div>
+    </div>
+    <div>
+      <h2>Layer</h2>
+      <div class="seg" role="group" aria-label="Layer">
+        <button id="colorBtn" aria-pressed="true">Color</button>
+        <button id="coverageBtn" aria-pressed="false" title="Range of angles the recording saw each point from (C)">Coverage</button>
+      </div>
+    </div>
+    <div id="legend" aria-live="polite">
+      <div class="ramp" aria-hidden="true"></div>
+      <div class="ramp-labels num"><span>one angle</span><span id="wideLabel">30°+ of angles</span></div>
+      <div class="unseen"><i aria-hidden="true"></i>seen by no frame</div>
+      <p class="hint">How many different angles the recording saw each point from. Amber areas break up when you move around them. This measures observation, not accuracy.</p>
+    </div>
+    <label class="check"><input type="checkbox" id="pathToggle" checked> Show recording path (P)</label>
+    <label class="check" id="boundsRow" title="Keep the camera inside the space the recording saw; an artificial wall marks the edge (B)"><input type="checkbox" id="boundsToggle" checked> Stay inside recorded space (B)</label>
+    <label class="check" id="heightRow" title="Keep the camera near the recording's height, where the reconstruction renders well; off lets you rise to the ceiling (H)"><input type="checkbox" id="heightToggle" checked> Limit height to what renders well (H)</label>
+    <p class="hint" id="modeHint">Drag to step out of the recording camera.</p>
+    <div id="objectsSection">
+      <h2>Objects</h2>
+      <label class="check" title="Tint, box and tag the objects found in the scene (O)"><input type="checkbox" id="objectsToggle"> Show objects (O)</label>
+      <ul id="objectList" aria-label="Objects in the scene"></ul>
+      <form id="scanForm" hidden>
+        <input id="scanPrompt" type="text" maxlength="40" autocomplete="off" placeholder="Scan for… (e.g. lamp)" aria-label="Object to scan for">
+        <button type="submit" id="scanBtn">Scan</button>
+      </form>
+      <p class="hint" id="objectsHint" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <figure id="inset">
+    <div class="frame"><img id="frameImg" alt="Recorded video frame at the current time"><canvas id="insetMask" hidden aria-hidden="true"></canvas></div>
+    <figcaption><span class="badge recorded">Recorded</span><span class="num" id="frameLabel"></span><span id="heldOut">held out of training</span></figcaption>
+  </figure>
+
+  <div id="toast" role="status"></div>
+  <div id="error" role="alert"></div>
+</main>
+
+<footer>
+  <button id="play" aria-label="Play">Play</button>
+  <button id="stepBack" aria-label="Previous recorded frame">◀</button>
+  <button id="stepFwd" aria-label="Next recorded frame">▶</button>
+  <input type="range" id="scrub" min="0" max="1000" value="0" step="1" aria-label="Event time">
+  <span id="timecode" class="num"></span>
+</footer>
+
+<script type="module">
+import * as THREE from "three";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+const $ = (id) => document.getElementById(id);
+const stage = $("stage");
+const base = new URLSearchParams(location.search).get("scene") || "scene/";
+
+function fail(msg) {
+  const el = $("error");
+  el.textContent = msg;
+  el.style.display = "grid";
+}
+
+let meta;
+try {
+  const res = await fetch(base + "scene.json");
+  if (!res.ok) throw new Error(res.status);
+  meta = await res.json();
+} catch (e) {
+  fail("No exported scene found. Run export_for_viewer.py, then reload.");
+  throw e;
+}
+
+const frames = meta.frames;
+const duration = frames[frames.length - 1].time;
+$("source").textContent = meta.source;
+if (meta.coverage?.wideDegrees) $("wideLabel").textContent = `${meta.coverage.wideDegrees}°+ of angles`;
+$("stats").textContent = `${meta.splatCount.toLocaleString()} splats · scale uncalibrated`;
+frames.forEach((f) => { new Image().src = base + "frames/" + f.name; });
+
+// Renderer and scene. The WebGL canvas is transparent so that, in GPU mode,
+// the path and marker draw over frames streamed from the GPU worker, which
+// sit on a 2D canvas underneath.
+const query = new URLSearchParams(location.search);
+const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.domElement.id = "gl";
+stage.prepend(renderer.domElement);
+renderer.domElement.tabIndex = 0;
+renderer.domElement.setAttribute("aria-label", "3D view of the reconstruction");
+const gpuCanvas = document.createElement("canvas");
+gpuCanvas.id = "gpuView";
+gpuCanvas.setAttribute("aria-hidden", "true");
+stage.prepend(gpuCanvas);
+const gpuCtx = gpuCanvas.getContext("2d");
+
+const BG = new THREE.Color(0x0e1013);
+const scene = new THREE.Scene();
+scene.background = BG;
+const camera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
+
+// Render splats the way they were trained. gsplat's classic mode dilates each
+// projected splat by 0.3 px without touching opacity; Spark's default instead
+// dilates and then lowers opacity (anti-aliased mode), which makes every small
+// splat of a classic-trained scene too transparent: hazy, low-contrast views.
+// preBlurAmount is applied before Spark's opacity compensation, so moving the
+// 0.3 px there reproduces classic mode exactly.
+// Measured on the kitchen: Spark's default (anti-aliased) blend scored 30.2 dB
+// against the recording vs 29.8 dB in classic mode, even for a classic-trained
+// scene, so default is the fallback. Scenes trained with --antialiased match
+// it exactly.
+const raster = query.get("raster") || meta.rasterization || "antialiased";
+// Walkthroughs put the camera right next to walls and columns, whose splats
+// can span more of the screen than Spark's defaults allow: it caps splat
+// radius at 512 px and drops splats centred beyond 1.4x the view edge, which
+// punches holes in nearby surfaces. gsplat, which trained the scene, does
+// neither.
+const nearFieldOptions = query.get("near") === "0" ? {} : { maxPixelRadius: 4096, clipXY: 3.0 };
+const sparkOptions = raster === "classic"
+  ? { renderer, preBlurAmount: 0.3, blurAmount: 0, maxStdDev: 3, ...nearFieldOptions }
+  : { renderer, ...nearFieldOptions };
+scene.add(new SparkRenderer(sparkOptions));
+
+// The reconstruction's own frame has an arbitrary "up"; rotate it so the
+// recording camera's average up becomes +Y.
+const root = new THREE.Group();
+root.quaternion.setFromUnitVectors(new THREE.Vector3(...meta.worldUp).normalize(), new THREE.Vector3(0, 1, 0));
+root.updateMatrixWorld(true);
+scene.add(root);
+
+// Spark packs splats with base colour clamped to [0, 1] (costs ~1.7 dB on
+// scenes whose colours go outside that range); the GPU renderer has no such
+// limit. See the experiment README.
+const colorLayer = new SplatMesh({ url: base + "scene.ply" });
+root.add(colorLayer);
+let coverageLayer = null;
+const rootInverse = root.matrixWorld.clone().invert();
+
+// Recorded camera poses. COLMAP cameras look down +z with +y down; three.js
+// cameras look down -z with +y up.
+const FLIP = new THREE.Matrix4().makeScale(1, -1, -1);
+const poses = frames.map((f) => {
+  const c2w = new THREE.Matrix4().set(...f.c2w.flat());
+  const world = root.matrixWorld.clone().multiply(c2w).multiply(FLIP);
+  const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
+  world.decompose(pos, quat, scl);
+  const fov = THREE.MathUtils.radToDeg(2 * Math.atan(f.height / 2 / f.fy));
+  return { pos, quat, fov };
+});
+
+function frameIndexAt(t) {
+  let i = 0;
+  while (i + 1 < frames.length && frames[i + 1].time <= t) i++;
+  return i;
+}
+function poseAt(t) {
+  const a = frameIndexAt(t), b = Math.min(frames.length - 1, a + 1);
+  const span = frames[b].time - frames[a].time;
+  const s = span > 0 ? THREE.MathUtils.clamp((t - frames[a].time) / span, 0, 1) : 0;
+  return {
+    pos: poses[a].pos.clone().lerp(poses[b].pos, s),
+    quat: poses[a].quat.clone().slerp(poses[b].quat, s),
+    fov: poses[a].fov,
+  };
+}
+
+// Recording path and a marker for where the recording camera is at time t.
+const pathLine = new THREE.Line(
+  new THREE.BufferGeometry().setFromPoints(poses.map((p) => p.pos)),
+  new THREE.LineBasicMaterial({ color: 0xf5a833, transparent: true, opacity: 0.8 }),
+);
+scene.add(pathLine);
+const marker = (() => {
+  const d = 0.08, w = d * 0.9, h = d * 0.5;
+  const pts = [[0, 0, 0], [-w, -h, -d], [0, 0, 0], [w, -h, -d], [0, 0, 0], [w, h, -d], [0, 0, 0], [-w, h, -d],
+    [-w, -h, -d], [w, -h, -d], [w, -h, -d], [w, h, -d], [w, h, -d], [-w, h, -d], [-w, h, -d], [-w, -h, -d]];
+  const g = new THREE.BufferGeometry().setFromPoints(pts.map((p) => new THREE.Vector3(...p)));
+  return new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0xf5a833 }));
+})();
+scene.add(marker);
+
+// Observed free space (free_space.py): voxels the recording saw straight
+// through. With "stay inside recorded space" on, the camera can go anywhere in
+// it, up to the ceiling included, and an artificial wall appears at its edge
+// instead of letting the view fly into space nothing was recorded from.
+const freeSpace = meta.freeSpace ? await (async () => {
+  try {
+    const buf = await (await fetch(base + meta.freeSpace.file)).arrayBuffer();
+    return { ...meta.freeSpace, grid: new Uint8Array(buf) };
+  } catch { return null; }
+})() : null;
+if (!freeSpace) { $("boundsRow").style.display = "none"; $("heightRow").style.display = "none"; }
+// Scene units are uncalibrated; movement speed and wall size follow the
+// scene's median surface distance.
+const unit = freeSpace?.medianDepth ?? 1;
+const _p = new THREE.Vector3();
+function freeViews(worldPos) {
+  const fs = freeSpace;
+  _p.copy(worldPos).applyMatrix4(rootInverse);
+  const i = Math.floor((_p.x - fs.origin[0]) / fs.voxelSize);
+  const j = Math.floor((_p.y - fs.origin[1]) / fs.voxelSize);
+  const k = Math.floor((_p.z - fs.origin[2]) / fs.voxelSize);
+  const [nx, ny, nz] = fs.dims;
+  if (i < 0 || j < 0 || k < 0 || i >= nx || j >= ny || k >= nz) return 0;
+  return fs.grid[(i * ny + j) * nz + k];
+}
+const BODY = 0.02;  // clearance around the camera, in scene units x unit
+// Height band around the recording path. Walkthrough footage is shot from
+// one height looking forward; well above it, floors and furniture were only
+// ever seen at shallow angles and render as streaks. With the limit on, the
+// artificial wall appears there instead. Fractions of the floor-to-ceiling
+// free extent. Default from the probe views (see README): about 0.5 m above
+// the recording height, where most of the unfilled house holds up. A scene
+// completed with complete_difix.py declares how high it was filled.
+const HEIGHT_BAND = { up: meta.navigation?.maxRise ?? 0.2, down: 0.35 };
+const roomHeight = freeSpace?.roomHeight ?? unit;
+function withinHeightBand(p) {
+  if (!$("heightToggle").checked) return true;
+  let best = Infinity, dy = 0;
+  for (const pose of poses) {
+    const d = (pose.pos.x - p.x) ** 2 + (pose.pos.z - p.z) ** 2;
+    if (d < best) { best = d; dy = p.y - pose.pos.y; }
+  }
+  return dy <= HEIGHT_BAND.up * roomHeight && dy >= -HEIGHT_BAND.down * roomHeight;
+}
+function isFree(p) {
+  const r = BODY * unit;
+  if (!withinHeightBand(p)) return false;
+  if (freeViews(p) < freeSpace.minViews) return false;
+  for (const [dx, dy, dz] of [[r, 0, 0], [-r, 0, 0], [0, r, 0], [0, -r, 0], [0, 0, r], [0, 0, -r]]) {
+    if (freeViews(_q.set(p.x + dx, p.y + dy, p.z + dz)) < freeSpace.minViews) return false;
+  }
+  return true;
+}
+const _q = new THREE.Vector3();
+
+// The artificial wall: a grid that fades in where a move was stopped.
+const wall = new THREE.Mesh(
+  new THREE.PlaneGeometry(1, 1),
+  new THREE.ShaderMaterial({
+    transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide,
+    uniforms: { opacity: { value: 0 }, color: { value: new THREE.Color(0x33c6e5) }, cells: { value: 12 } },
+    vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+    fragmentShader: `uniform float opacity; uniform vec3 color; uniform float cells; varying vec2 vUv;
+      void main() {
+        vec2 g = abs(fract(vUv * cells - 0.5) - 0.5) / fwidth(vUv * cells);
+        float line = 1.0 - min(min(g.x, g.y), 1.0);
+        float fade = 1.0 - smoothstep(0.25, 0.5, length(vUv - 0.5));
+        gl_FragColor = vec4(color, (0.08 + 0.5 * line) * fade * opacity);
+      }`,
+  }),
+);
+wall.visible = false;
+wall.renderOrder = 10;
+scene.add(wall);
+let wallShownAt = -1e9;
+function showWall(at, normal) {
+  wall.position.copy(at);
+  wall.lookAt(_q.copy(at).add(normal));
+  wall.scale.setScalar(0.6 * unit);
+  wall.visible = true;
+  wallShownAt = performance.now();
+  toast.textContent = "Edge of recorded space";
+}
+function fadeWall(now) {
+  const age = (now - wallShownAt) / 1000;
+  wall.material.uniforms.opacity.value = Math.max(0, 1 - age / 1.2);
+  if (age > 1.2 && wall.visible) {
+    wall.visible = false;
+    if (toast.textContent === "Edge of recorded space") toast.textContent = "";
+  }
+}
+
+// First-person camera control: drag to look (straight up and down included),
+// W/S move the way you're looking, A/D strafe, Q/E straight down/up, wheel
+// moves forward/back, Shift is faster.
+let locked = true;
+let yaw = 0, pitch = 0;
+const UP = new THREE.Vector3(0, 1, 0);
+function syncYawPitch() {
+  const d = camera.getWorldDirection(new THREE.Vector3());
+  yaw = Math.atan2(-d.x, -d.z);
+  pitch = Math.asin(THREE.MathUtils.clamp(d.y, -1, 1));
+}
+function applyYawPitch() {
+  camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, "YXZ"));
+}
+
+function setLocked(next) {
+  locked = next;
+  $("lockBtn").setAttribute("aria-pressed", String(locked));
+  $("freeBtn").setAttribute("aria-pressed", String(!locked));
+  marker.visible = !locked && $("pathToggle").checked;
+  $("modeHint").textContent = locked
+    ? "Drag to step out of the recording camera."
+    : "Drag to look. W/S move where you look, A/D sideways, Q/E down/up, Shift faster. Scrubbing keeps your camera.";
+  if (!locked) syncYawPitch();
+}
+setLocked(true);
+
+let drag = null;
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  if (locked) setLocked(false);
+  drag = { x: e.clientX, y: e.clientY, button: e.button };
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener("pointermove", (e) => {
+  if (!drag || locked) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (drag.button === 0) {
+    yaw -= dx * 0.004;
+    pitch = THREE.MathUtils.clamp(pitch - dy * 0.004, -1.55, 1.55);
+    applyYawPitch();
+  } else {
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion);
+    tryMove(right.multiplyScalar(-dx * 0.002 * unit).addScaledVector(UP, dy * 0.002 * unit));
+  }
+});
+renderer.domElement.addEventListener("pointerup", () => { drag = null; });
+renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
+renderer.domElement.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  if (locked) setLocked(false);
+  tryMove(camera.getWorldDirection(new THREE.Vector3()).multiplyScalar(-Math.sign(e.deltaY) * 0.08 * unit));
+}, { passive: false });
+$("lockBtn").onclick = () => setLocked(true);
+$("freeBtn").onclick = () => setLocked(false);
+
+// Move the camera by delta, staying inside observed free space when asked:
+// blocked moves slide along the boundary; a fully blocked move shows the wall.
+function tryMove(delta) {
+  const from = camera.position;
+  const enforce = freeSpace && $("boundsToggle").checked && isFree(from);
+  if (!enforce) { from.add(delta); return; }
+  const to = from.clone().add(delta);
+  if (isFree(to)) { from.copy(to); return; }
+  // Slide: keep the components of the move that stay inside.
+  const blocked = new THREE.Vector3();
+  for (const axis of ["x", "y", "z"]) {
+    if (delta[axis] === 0) continue;
+    const step = from.clone();
+    step[axis] += delta[axis];
+    if (isFree(step)) from.copy(step);
+    else blocked[axis] = Math.sign(delta[axis]);
+  }
+  // Put the wall on the side that stopped the move, facing the camera.
+  const dir = (blocked.lengthSq() ? blocked : delta.clone()).normalize();
+  showWall(from.clone().addScaledVector(dir, 0.08 * unit), dir.clone().negate());
+}
+
+const keys = new Set();
+function flyStep(dt) {
+  if (!keys.size) return;
+  const speed = (keys.has("Shift") ? 0.9 : 0.3) * unit * dt;
+  const fwd = camera.getWorldDirection(new THREE.Vector3());
+  const flat = fwd.clone().setY(0).normalize();
+  const right = new THREE.Vector3().crossVectors(flat, UP);
+  const move = new THREE.Vector3();
+  if (keys.has("w")) move.add(fwd);
+  if (keys.has("s")) move.sub(fwd);
+  if (keys.has("d")) move.add(right);
+  if (keys.has("a")) move.sub(right);
+  if (keys.has("e")) move.y += 1;
+  if (keys.has("q")) move.y -= 1;
+  if (move.lengthSq() === 0) return;
+  tryMove(move.normalize().multiplyScalar(speed));
+}
+
+// Layers
+let coverageOn = false;
+function setLayer(coverage) {
+  coverageOn = coverage;
+  $("colorBtn").setAttribute("aria-pressed", String(!coverage));
+  $("coverageBtn").setAttribute("aria-pressed", String(coverage));
+  $("legend").classList.toggle("on", coverage);
+  if (coverage && !coverageLayer) {
+    coverageLayer = new SplatMesh({ url: base + "coverage.splat" });
+    root.add(coverageLayer);
+  }
+  updateRendererUI();
+}
+$("colorBtn").onclick = () => setLayer(false);
+$("coverageBtn").onclick = () => setLayer(true);
+
+// GPU worker (optional, local). When it is connected, the colour layer is
+// rendered by gsplat, the renderer the scene was trained with, on the local
+// GPU and streamed here as JPEG frames. Without it, Spark renders in the
+// browser. One request is in flight at a time and a frame older than the one
+// on screen is never drawn, so a moving camera cannot show stale views.
+const workerUrl = query.get("worker") || "ws://127.0.0.1:8791";
+const sceneName = base.replace(/\/+$/, "").split("/").pop();
+const gpu = { ws: null, ready: false, device: "", backend: "", inFlight: 0, nextId: 1, shownId: 0,
+  lastKey: "", ms: 0, rtt: 0, sentAt: 0, waiters: new Map() };
+let preferGpu = query.get("renderer") !== "local";
+
+function gpuActive() {
+  return preferGpu && gpu.ready && !coverageOn;
+}
+
+function updateRendererUI() {
+  const active = gpuActive();
+  $("gpuBtn").setAttribute("aria-pressed", String(preferGpu));
+  $("localBtn").setAttribute("aria-pressed", String(!preferGpu));
+  $("gpuBtn").disabled = !gpu.ready;
+  colorLayer.visible = !coverageOn && !active;
+  if (coverageLayer) coverageLayer.visible = coverageOn;
+  scene.background = active ? null : BG;
+  gpuCanvas.style.visibility = active ? "visible" : "hidden";
+  const status = $("gpuStatus");
+  status.classList.toggle("on", gpu.ready);
+  status.textContent = gpu.ready
+    ? `GPU · ${gpu.device.replace(/^NVIDIA GeForce /, "")}${active && gpu.ms ? ` · ${Math.round(gpu.rtt)} ms` : ""}`
+    : "GPU worker offline";
+  $("rendererHint").textContent = !gpu.ready
+    ? "GPU worker not running: rendering in the browser. Start gpu_render_server.py for full quality."
+    : coverageOn ? "Coverage renders in the browser."
+    : active ? `gsplat on the GPU (${gpu.backend}), the renderer the scene was trained with.`
+    : "Rendering in the browser (Spark).";
+  $("viewBadge").textContent = coverageOn ? "Reconstructed · coverage"
+    : active ? "Reconstructed · GPU render" : "Reconstructed · browser render";
+  updateObjectsHint();
+}
+$("gpuBtn").onclick = () => { preferGpu = true; updateRendererUI(); };
+$("localBtn").onclick = () => { preferGpu = false; updateRendererUI(); };
+
+function connectWorker() {
+  let ws;
+  try { ws = new WebSocket(workerUrl); } catch { return; }
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === "string") {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "hello") {
+        Object.assign(gpu, { ws, ready: msg.capabilities?.includes("render"), device: msg.device, backend: msg.backend });
+        updateRendererUI();
+      } else if (msg.type === "error") {
+        gpu.inFlight = 0;
+        gpu.waiters.get(msg.id)?.reject(new Error(msg.message));
+        gpu.waiters.delete(msg.id);
+        toast.textContent = `GPU render failed: ${msg.message}`;
+      }
+      return;
+    }
+    const n = new DataView(ev.data).getUint32(0, true);
+    const header = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+    const jpeg = new Blob([new Uint8Array(ev.data, 4 + n)], { type: "image/jpeg" });
+    if (header.id === gpu.inFlight) gpu.inFlight = 0;
+    const waiter = gpu.waiters.get(header.id);
+    if (waiter) { gpu.waiters.delete(header.id); waiter.resolve(jpeg); return; }
+    gpu.ms = header.renderMs + header.encodeMs;
+    gpu.rtt = performance.now() - gpu.sentAt;
+    createImageBitmap(jpeg).then((bmp) => {
+      if (header.id <= gpu.shownId) return;  // never draw over a newer frame
+      gpu.shownId = header.id;
+      if (gpuCanvas.width !== bmp.width || gpuCanvas.height !== bmp.height) {
+        gpuCanvas.width = bmp.width; gpuCanvas.height = bmp.height;
+      }
+      gpuCtx.drawImage(bmp, 0, 0);
+      bmp.close();
+    });
+  };
+  ws.onclose = () => {
+    const wasReady = gpu.ready;
+    Object.assign(gpu, { ws: null, ready: false, inFlight: 0 });
+    for (const w of gpu.waiters.values()) w.reject(new Error("GPU worker disconnected"));
+    gpu.waiters.clear();
+    updateRendererUI();
+    if (wasReady) toast.textContent = "GPU worker disconnected: rendering in the browser.";
+    setTimeout(connectWorker, 5000);
+  };
+}
+
+// Current camera as a worker request: camera-to-world in the scene's own
+// (COLMAP, OpenCV-camera) frame, square pixels, centred principal point.
+function gpuRequest(w, h, background, quality = 90) {
+  camera.updateMatrixWorld();
+  const e = rootInverse.clone().multiply(camera.matrixWorld).multiply(FLIP).elements;  // column-major
+  const c2w = [e[0], e[4], e[8], e[12], e[1], e[5], e[9], e[13], e[2], e[6], e[10], e[14], 0, 0, 0, 1];
+  const fy = (h / 2) / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
+  return { type: "render", id: gpu.nextId++, scene: sceneName, c2w, fx: fy, fy, cx: w / 2, cy: h / 2,
+    width: w, height: h, quality, background,
+    objects: objects.list.length ? { show: objects.show, focus: objects.focus || null } : undefined };
+}
+
+// GPU frames are rendered at the canvas's pixel size, capped at ~2.5 MP.
+function gpuSize() {
+  const w = renderer.domElement.width, h = renderer.domElement.height;
+  const s = Math.min(1, Math.sqrt(2.5e6 / (w * h)));
+  return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
+}
+
+function requestGpuFrame() {
+  if (gpu.inFlight || !gpu.ws) return;
+  const [w, h] = gpuSize();
+  const req = gpuRequest(w, h, [BG.r, BG.g, BG.b]);
+  const key = `${w}x${h}:${req.c2w.map((v) => v.toFixed(5)).join(",")}:${camera.fov.toFixed(3)}`
+    + `:${objects.version}:${objects.show}:${objects.focus}`;
+  if (key === gpu.lastKey) return;
+  gpu.lastKey = key;
+  gpu.inFlight = req.id;
+  gpu.sentAt = performance.now();
+  gpu.ws.send(JSON.stringify(req));
+}
+
+// One-off render for captures; resolves with the JPEG.
+function gpuRenderOnce(w, h, background) {
+  const req = gpuRequest(w, h, background, 95);
+  return new Promise((resolve, reject) => {
+    gpu.waiters.set(req.id, { resolve, reject });
+    gpu.ws.send(JSON.stringify(req));
+  });
+}
+$("pathToggle").onchange = (e) => {
+  pathLine.visible = e.target.checked;
+  marker.visible = e.target.checked && !locked;
+};
+
+// Time
+let t = 0, playing = false, shownFrame = -1;
+function setPlaying(p) {
+  playing = p && t < duration;
+  $("play").textContent = playing ? "Pause" : "Play";
+  $("play").setAttribute("aria-label", playing ? "Pause" : "Play");
+}
+function seek(time) { t = THREE.MathUtils.clamp(time, 0, duration); }
+function step(dir) {
+  setPlaying(false);
+  const i = THREE.MathUtils.clamp(frameIndexAt(t + 1e-6) + dir, 0, frames.length - 1);
+  seek(frames[i].time);
+}
+$("play").onclick = () => { if (t >= duration) seek(0); setPlaying(!playing); };
+$("stepBack").onclick = () => step(-1);
+$("stepFwd").onclick = () => step(1);
+$("scrub").oninput = (e) => { setPlaying(false); seek((e.target.value / 1000) * duration); };
+
+function fmt(sec) {
+  const m = Math.floor(sec / 60), s = sec - m * 60;
+  return `${String(m).padStart(2, "0")}:${s.toFixed(2).padStart(5, "0")}`;
+}
+function syncTimeUI() {
+  $("scrub").value = String(Math.round((t / duration) * 1000));
+  $("timecode").textContent = `${fmt(t)} / ${fmt(duration)}`;
+  const i = frameIndexAt(t);
+  if (i !== shownFrame) {
+    shownFrame = i;
+    const f = frames[i];
+    $("frameImg").src = base + "frames/" + f.name;
+    $("frameLabel").textContent = `frame ${f.sourceFrame}`;
+    $("heldOut").style.display = f.heldOut ? "inline" : "none";
+  }
+  drawInsetMask(i);
+  const p = poseAt(t);
+  marker.position.copy(p.pos);
+  marker.quaternion.copy(p.quat);
+}
+
+// Objects found by scan_objects.py: SAM 3.1 tracks through the recorded clips,
+// placed on the splats by lift_objects.py. Boxes, tags and the recorded-frame
+// masks work in both renderers; tinting the splats needs the GPU worker.
+const objects = { list: [], byId: new Map(), show: false, focus: 0, version: 0, maskCache: new Map() };
+const objectsGroup = new THREE.Group();  // in the scene's own frame, like the splats
+root.add(objectsGroup);
+const BOX_EDGES = new THREE.EdgesGeometry(new THREE.BoxGeometry(2, 2, 2));
+const TAG_RANGE = 4;  // tags and boxes of unfocused objects show within this many x unit
+const scanUI = { available: false, wasRunning: false, message: "" };
+
+async function loadObjects() {
+  let data = null;
+  if (meta.objects) {
+    try {
+      const res = await fetch(base + meta.objects.file);
+      if (res.ok) data = await res.json();
+    } catch { /* no objects yet */ }
+  }
+  objects.list = data?.objects ?? [];
+  objects.byId = new Map(objects.list.map((o) => [o.id, o]));
+  objects.version++;
+  objects.maskCache.clear();
+  if (!objects.byId.has(objects.focus)) objects.focus = 0;
+  buildObjectViews();
+  renderObjectList();
+  updateObjectViews();
+}
+
+function buildObjectViews() {
+  for (const c of objectsGroup.children) c.material.dispose();
+  objectsGroup.clear();
+  $("objTags").replaceChildren();
+  for (const o of objects.list) {
+    const [e1, e2, e3] = o.box.axes.map((a) => new THREE.Vector3(...a));
+    const [hx, hy, hz] = o.box.half;
+    const center = new THREE.Vector3(...o.box.center);
+    const box = new THREE.LineSegments(BOX_EDGES, new THREE.LineBasicMaterial({
+      color: new THREE.Color(`rgb(${o.color.join(",")})`), transparent: true, depthTest: false }));
+    box.matrixAutoUpdate = false;
+    box.matrix.makeBasis(e1.clone().multiplyScalar(hx), e2.clone().multiplyScalar(hy), e3.clone().multiplyScalar(hz))
+      .setPosition(center);
+    box.renderOrder = 5;
+    objectsGroup.add(box);
+    const tag = document.createElement("button");
+    tag.className = "objtag";
+    tag.textContent = o.name;
+    tag.style.setProperty("--c", `rgb(${o.color.join(",")})`);
+    tag.onclick = () => focusObject(objects.focus === o.id ? 0 : o.id);
+    $("objTags").append(tag);
+    o.view = { box, tag, center, top: center.clone().addScaledVector(e3, hz) };
+  }
+}
+
+function fmtShort(sec) {
+  return `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+}
+
+function renderObjectList() {
+  const ul = $("objectList");
+  ul.replaceChildren();
+  const byLabel = new Map();
+  for (const o of objects.list) {
+    if (!byLabel.has(o.label)) byLabel.set(o.label, []);
+    byLabel.get(o.label).push(o);
+  }
+  for (const [label, objs] of byLabel) {
+    const head = document.createElement("li");
+    head.className = "objgroup";
+    head.textContent = `${label} · ${objs.length}`;
+    ul.append(head);
+    for (const o of objs) {
+      const li = document.createElement("li");
+      const b = document.createElement("button");
+      b.dataset.id = o.id;
+      b.title = `Pick out ${o.name} and jump to the recorded frame that shows it best`;
+      const swatch = document.createElement("i");
+      swatch.style.background = `rgb(${o.color.join(",")})`;
+      const name = document.createElement("span");
+      name.textContent = o.name;
+      const time = document.createElement("span");
+      time.className = "time num";
+      time.textContent = fmtShort(frames[o.bestFrame].time);
+      b.append(swatch, name, time);
+      b.onclick = () => focusObject(objects.focus === o.id ? 0 : o.id);
+      li.append(b);
+      ul.append(li);
+    }
+  }
+}
+
+function updateObjectViews() {
+  for (const o of objects.list) {
+    const focused = o.id === objects.focus;
+    o.view.on = objects.focus ? focused : objects.show;
+    o.view.box.material.opacity = focused ? 1 : 0.6;
+    o.view.tag.classList.toggle("focus", focused);
+  }
+  for (const b of $("objectList").querySelectorAll("button[data-id]")) {
+    b.setAttribute("aria-pressed", String(Number(b.dataset.id) === objects.focus));
+  }
+  $("objectsToggle").checked = objects.show;
+  updateObjectsHint();
+}
+
+function updateObjectsHint() {
+  let text;
+  if (scanUI.message) text = scanUI.message;
+  else if (!objects.list.length) {
+    text = scanUI.available ? "No objects yet. Type what to look for and press Scan (a few minutes per prompt)."
+      : "No objects yet. Run scan_objects.py to find some.";
+  } else if (!gpuActive() && (objects.show || objects.focus)) {
+    text = "Tinting needs the GPU renderer; the browser renderer shows boxes and tags only.";
+  } else {
+    const prompts = [...new Set(objects.list.map((o) => o.label))].join(", ");
+    text = `${objects.list.length} objects (${prompts}). Click one to pick it out; Esc lets go.`;
+  }
+  if ($("objectsHint").textContent !== text) $("objectsHint").textContent = text;
+}
+
+// Pick out one object: jump to the recorded frame that shows it best and, in
+// free mode, look at it from that frame's camera position.
+function focusObject(id) {
+  objects.focus = id;
+  const o = objects.byId.get(id);
+  if (o) {
+    setPlaying(false);
+    seek(frames[o.bestFrame].time);
+    if (!locked) {
+      camera.position.copy(poses[o.bestFrame].pos);
+      camera.lookAt(root.localToWorld(o.view.center.clone()));
+      syncYawPitch();
+      applyYawPitch();
+    }
+  }
+  updateObjectViews();
+}
+
+const _tagPos = new THREE.Vector3();
+function placeObjectViews() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  for (const o of objects.list) {
+    const { box, tag, center, top } = o.view;
+    let show = o.view.on;
+    if (show && o.id !== objects.focus) {
+      show = camera.position.distanceTo(root.localToWorld(_tagPos.copy(center))) < TAG_RANGE * unit;
+    }
+    box.visible = show;
+    if (show) {
+      _tagPos.copy(top).applyMatrix4(root.matrixWorld).project(camera);
+      show = _tagPos.z < 1 && Math.abs(_tagPos.x) < 1.05 && Math.abs(_tagPos.y) < 1.05;
+    }
+    tag.hidden = !show;
+    if (show) {
+      tag.style.transform = `translate(${(_tagPos.x * 0.5 + 0.5) * w}px, ${(-_tagPos.y * 0.5 + 0.5) * h}px) `
+        + "translate(-50%, -130%)";
+    }
+  }
+}
+
+// Recorded-frame masks (lift_objects.py): object id = R + 256 G per pixel.
+const maskCtx = $("insetMask").getContext("2d");
+let maskKey = "";
+async function maskIds(f) {
+  const url = base + "objects/" + f.name.replace(/\.[^.]+$/, ".png");
+  if (objects.maskCache.has(url)) return objects.maskCache.get(url);
+  let out = null;
+  try {
+    const res = await fetch(url);
+    if (res.ok) {
+      const bmp = await createImageBitmap(await res.blob(), { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+      const c = new OffscreenCanvas(bmp.width, bmp.height);
+      const cx = c.getContext("2d", { willReadFrequently: true });
+      cx.drawImage(bmp, 0, 0);
+      const px = cx.getImageData(0, 0, bmp.width, bmp.height).data;
+      const data = new Uint16Array(bmp.width * bmp.height);
+      for (let p = 0; p < data.length; p++) data[p] = px[4 * p] + 256 * px[4 * p + 1];
+      out = { w: bmp.width, h: bmp.height, data };
+      bmp.close();
+    }
+  } catch { /* no mask for this frame */ }
+  objects.maskCache.set(url, out);
+  if (objects.maskCache.size > 40) objects.maskCache.delete(objects.maskCache.keys().next().value);
+  return out;
+}
+async function drawInsetMask(i) {
+  const key = `${i}:${objects.version}:${objects.show}:${objects.focus}`;
+  if (key === maskKey) return;
+  maskKey = key;
+  const canvas = $("insetMask");
+  if (!objects.list.length || !(objects.show || objects.focus)) { canvas.hidden = true; return; }
+  const ids = await maskIds(frames[i]);
+  if (maskKey !== key) return;  // a newer frame or state took over
+  if (!ids) { canvas.hidden = true; return; }
+  if (canvas.width !== ids.w || canvas.height !== ids.h) { canvas.width = ids.w; canvas.height = ids.h; }
+  const img = maskCtx.createImageData(ids.w, ids.h);
+  const alpha = objects.focus ? 170 : 130;
+  for (let p = 0; p < ids.data.length; p++) {
+    const id = ids.data[p];
+    if (!id || (objects.focus && id !== objects.focus)) continue;
+    const o = objects.byId.get(id);
+    if (!o) continue;
+    img.data[4 * p] = o.color[0]; img.data[4 * p + 1] = o.color[1]; img.data[4 * p + 2] = o.color[2];
+    img.data[4 * p + 3] = alpha;
+  }
+  maskCtx.putImageData(img, 0, 0);
+  canvas.hidden = false;
+}
+
+$("objectsToggle").onchange = (e) => { objects.show = e.target.checked; updateObjectViews(); };
+
+// Scanning (served by serve.py): track a new prompt through every clip with
+// SAM 3.1, then place what it finds. One scan at a time.
+async function pollScan() {
+  let st;
+  try {
+    const res = await fetch("/__scan");
+    if (!res.ok) throw new Error(res.status);
+    st = await res.json();
+  } catch {
+    scanUI.available = false;
+    $("scanForm").hidden = true;
+    updateObjectsHint();
+    return;
+  }
+  scanUI.available = true;
+  $("scanForm").hidden = false;
+  const running = st.state === "running";
+  $("scanBtn").disabled = running;
+  if (running) {
+    const secs = Math.round(Date.now() / 1000 - st.started);
+    const count = st.steps ? ` (${Math.min(st.step + 1, st.steps)} of ${st.steps})` : "";
+    scanUI.message = st.scene === sceneName
+      ? `Scanning for "${st.prompt}": ${st.message}${count} · ${secs} s`
+      : `Busy scanning ${st.scene} for "${st.prompt}".`;
+    setTimeout(pollScan, 1000);
+  } else if (scanUI.wasRunning) {
+    scanUI.message = "";
+    if (st.state === "done" && st.scene === sceneName) {
+      meta.objects = meta.objects ?? { file: "objects.json" };
+      await loadObjects();
+      objects.show = true;
+      updateObjectViews();
+      toast.textContent = `Scan for "${st.prompt}" finished: ${st.message}.`;
+    } else if (st.state === "failed") {
+      scanUI.message = `Scan for "${st.prompt}" failed: ${st.message}`;
+    }
+  }
+  scanUI.wasRunning = running;
+  updateObjectsHint();
+}
+
+$("scanForm").onsubmit = async (e) => {
+  e.preventDefault();
+  const prompt = $("scanPrompt").value.trim();
+  if (!prompt) return;
+  let res, body = {};
+  try {
+    res = await fetch("/__scan", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scene: sceneName, prompt }) });
+    body = await res.json().catch(() => ({}));
+  } catch (err) {
+    scanUI.message = `Could not start the scan: ${err.message}`;
+    updateObjectsHint();
+    return;
+  }
+  if (!res.ok) {
+    scanUI.message = body.error || `Could not start the scan (${res.status}).`;
+    updateObjectsHint();
+    return;
+  }
+  $("scanPrompt").value = "";
+  scanUI.wasRunning = true;
+  pollScan();
+};
+
+window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLInputElement && e.target.type === "text") return;  // typing a scan prompt
+  if (e.target instanceof HTMLInputElement && e.target.type === "checkbox" && e.key === " ") return;
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k === " ") { e.preventDefault(); $("play").click(); }
+  else if (k === "ArrowLeft") { e.preventDefault(); step(-1); }
+  else if (k === "ArrowRight") { e.preventDefault(); step(1); }
+  else if (k === "l") setLocked(!locked);
+  else if (k === "c") setLayer(!coverageOn);
+  else if (k === "g" && gpu.ready) { preferGpu = !preferGpu; updateRendererUI(); }
+  else if (k === "p") { $("pathToggle").click(); }
+  else if (k === "b" && freeSpace) { $("boundsToggle").click(); }
+  else if (k === "h" && freeSpace) { $("heightToggle").click(); }
+  else if (k === "o" && objects.list.length) { $("objectsToggle").click(); }
+  else if (k === "Escape" && objects.focus) { focusObject(0); }
+  else if (!locked && "wasdqe".includes(k)) keys.add(k);
+  if (e.key === "Shift") keys.add("Shift");
+});
+window.addEventListener("keyup", (e) => {
+  keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key);
+});
+window.addEventListener("blur", () => keys.clear());
+
+// Resize and loop
+let fixedSize = null;  // [w, h] while capturing
+function resize() {
+  const [w, h] = fixedSize ?? [stage.clientWidth, stage.clientHeight];
+  if (!w || !h) return;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+resize();
+
+let last = performance.now(), fpsAcc = 0, fpsN = 0, fpsShown = 0;
+const toast = $("toast");
+toast.textContent = "Loading splats…";
+colorLayer.initialized?.then(() => { toast.textContent = ""; }).catch(() => fail("Could not load scene.ply."));
+updateRendererUI();
+connectWorker();
+loadObjects();
+pollScan();
+
+renderer.setAnimationLoop((now) => {
+  const dt = Math.min(0.1, (now - last) / 1000);
+  last = now;
+  if (playing) {
+    t += dt;
+    if (t >= duration) { t = duration; setPlaying(false); }
+  }
+  syncTimeUI();
+  if (fixedSize) {
+    // capture in progress: camera is set explicitly
+  } else if (locked) {
+    const p = poseAt(t);
+    camera.position.copy(p.pos);
+    camera.quaternion.copy(p.quat);
+    if (camera.fov !== p.fov) { camera.fov = p.fov; camera.updateProjectionMatrix(); }
+  } else {
+    flyStep(dt);
+  }
+  fadeWall(now);
+  const active = gpuActive();
+  if (active && !fixedSize) requestGpuFrame();
+  placeObjectViews();
+  renderer.render(scene, camera);  // in GPU mode this draws only the path, marker and object boxes
+
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc > 0.5) {
+    fpsShown = Math.round(fpsN / fpsAcc);
+    fpsAcc = 0; fpsN = 0;
+    updateRendererUI();
+  }
+  // In GPU mode frames arrive only when the camera moves; report the worker's
+  // round trip instead of the browser's redraw rate.
+  const rate = active ? (gpu.rtt ? `GPU up to ${Math.round(1000 / gpu.rtt)} fps` : "GPU") : `${fpsShown} fps`;
+  $("stats").textContent = `${meta.splatCount.toLocaleString()} splats · ${rate} · scale uncalibrated`;
+});
+
+// Debug/automation hook: lets tests place the camera and read state.
+window.__viewer = {
+  get t() { return t; }, get fps() { return fpsShown; },
+  seek, setLocked, setLayer, camera, frames, poseAt, tryMove, isFree: (p) => freeSpace ? isFree(p) : true,
+  objects: () => objects.list.map(({ view, ...o }) => ({ ...o, tagShown: !view.tag.hidden })),
+  focusObject, loadObjects, pollScan,
+  showObjects(on) { objects.show = on; updateObjectViews(); },
+  lookFrom(pos, target) {
+    setLocked(false);
+    camera.position.copy(pos);
+    camera.lookAt(target);
+    syncYawPitch();
+    applyYawPitch();
+  },
+  // Render recorded frame i's exact camera at w x h and save it via the dev
+  // server, for pixel-aligned comparison with the training renderer.
+  layers: () => ({ colorLayer, coverageLayer }),
+  // Uses whichever renderer is active (GPU worker or Spark).
+  async captureFrame(i, w, h, name) {
+    const f = frames[i];
+    fixedSize = [w, h];
+    renderer.setPixelRatio(1);
+    resize();
+    camera.position.copy(poses[i].pos);
+    camera.quaternion.copy(poses[i].quat);
+    camera.fov = poses[i].fov;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    let blob;
+    if (gpuActive()) {
+      blob = await gpuRenderOnce(w, h, [0, 0, 0]);
+    } else {
+      const bg = scene.background;
+      scene.background = new THREE.Color(0x000000);
+      const helpers = [pathLine.visible, marker.visible];
+      pathLine.visible = marker.visible = false;
+      // Spark sorts splats in a worker; render a few times so the sort settles.
+      for (let k = 0; k < 8; k++) {
+        renderer.render(scene, camera);
+        await new Promise((r) => setTimeout(r, 120));
+      }
+      renderer.render(scene, camera);
+      blob = await (await fetch(renderer.domElement.toDataURL("image/png"))).blob();
+      scene.background = bg;
+      [pathLine.visible, marker.visible] = helpers;
+    }
+    await fetch(`/__capture?name=${encodeURIComponent(name)}`, { method: "POST", body: blob });
+    return { name, frame: f.name, w, h, renderer: gpuActive() ? "gpu" : "spark" };
+  },
+  // Record playback from the recording camera: one JPEG per output frame.
+  // settle = renders per frame before capture (1-2 mimics live playback,
+  // where the splat sort can lag a frame behind the camera).
+  async captureSequence(prefix, { fps = 15, w, h, settle = 2, t0 = 0, t1 = duration } = {}) {
+    w = w ?? frames[0].width / 2;
+    h = h ?? frames[0].height / 2;
+    fixedSize = [w, h];
+    renderer.setPixelRatio(1);
+    resize();
+    const bg = scene.background;
+    scene.background = new THREE.Color(0x000000);
+    const helpers = [pathLine.visible, marker.visible];
+    pathLine.visible = marker.visible = false;
+    let n = 0;
+    for (let tt = t0; tt <= t1 + 1e-6; tt += 1 / fps, n++) {
+      const p = poseAt(tt);
+      camera.position.copy(p.pos);
+      camera.quaternion.copy(p.quat);
+      camera.fov = p.fov;
+      camera.aspect = w / h;
+      camera.updateProjectionMatrix();
+      let blob;
+      if (gpuActive()) {
+        blob = await gpuRenderOnce(w, h, [0, 0, 0]);
+      } else {
+        for (let k = 0; k < settle; k++) {
+          renderer.render(scene, camera);
+          await new Promise((r) => setTimeout(r, 16));
+        }
+        blob = await (await fetch(renderer.domElement.toDataURL("image/jpeg", 0.92))).blob();
+      }
+      const index = Math.round(tt * fps);  // numbered by time so runs can be split
+      await fetch(`/__capture?name=${prefix}_${String(index).padStart(4, "0")}.jpg`, { method: "POST", body: blob });
+    }
+    scene.background = bg;
+    [pathLine.visible, marker.visible] = helpers;
+    return n;
+  },
+  endCapture() {
+    fixedSize = null;
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    resize();
+  },
+};
+</script>
+</body>
+</html>

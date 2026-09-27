@@ -1,0 +1,11 @@
+﻿{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "exp01-viewer",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["D:/braindance-studio/experiments/01-walkthrough-recon/viewer/serve.py", "8790"],
+      "port": 8790
+    }
+  ]
+}

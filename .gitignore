@@ -1,0 +1,11 @@
+# Python environments
+.venv*/
+__pycache__/
+
+# Third-party tools fetched by setup (see experiments/*/README.md)
+tools/
+
+# Downloaded source media and generated outputs
+experiments/*/data/
+experiments/*/work/
+experiments/*/viewer/*/
