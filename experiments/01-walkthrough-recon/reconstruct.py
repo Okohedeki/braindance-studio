@@ -53,7 +53,15 @@ def main():
     ap.add_argument("--cap-max", type=int, default=1_000_000)
     ap.add_argument("--no-antialiased", action="store_true")
     ap.add_argument("--no-pose-opt", action="store_true")
+    ap.add_argument("--source", help="credit line for the viewer (default: the Kindel Media clips of experiment 01)")
+    ap.add_argument("--source-fps", type=float, help="frame rate of the source videos (default: read from the first clip)")
     args = ap.parse_args()
+    if args.source_fps is None:
+        rate = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                               "stream=r_frame_rate", "-of", "csv=p=0", str(HERE / "data" / "clips" / f"{args.clips[0]}.mp4")],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        num, den = rate.split("/")
+        args.source_fps = float(num) / float(den)
 
     work = HERE / "work" / args.scene
     images = work / "images"
@@ -132,9 +140,9 @@ def main():
     clips = [c for c in args.clips if c in report["kept"]]
     run([sys.executable, HERE / "export_for_viewer.py", "--data-dir", train, "--ckpt", ckpt,
          "--frames", images, "--out", HERE / "viewer" / args.scene,
-         "--frame-step", args.frame_step, "--clips", *clips,
+         "--frame-step", args.frame_step, "--source-fps", args.source_fps, "--clips", *clips,
          "--rasterization", "antialiased" if antialiased else "classic",
-         "--source", "Pexels " + ", ".join(clips) + " by Kindel Media (Pexels license)"],
+         "--source", args.source or ("Pexels " + ", ".join(clips) + " by Kindel Media (Pexels license)")],
         logs / "export.log")
     print(f"viewer package: {HERE / 'viewer' / args.scene}")
 

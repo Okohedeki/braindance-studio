@@ -31,7 +31,11 @@ def venv_python(name):
 
 
 def run(cmd, log):
-    env = {**os.environ, "PYTHONWARNINGS": "ignore", "PYTHONUNBUFFERED": "1"}
+    # Without the variables a venv launcher sets, so each environment's Python
+    # loads its own standard library.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("__PYVENV_LAUNCHER__", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}
+    env.update(PYTHONWARNINGS="ignore", PYTHONUNBUFFERED="1")
     log.write(f"\n$ {' '.join(map(str, cmd))}\n")
     log.flush()
     with subprocess.Popen([str(c) for c in cmd], cwd=HERE, env=env, stdout=subprocess.PIPE,
