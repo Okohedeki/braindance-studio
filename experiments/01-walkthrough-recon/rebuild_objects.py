@@ -3,8 +3,8 @@
   python rebuild_objects.py --scene courtyard-infer --out courtyard-objects
 
 For each chosen object (default: the largest --limit free-standing objects
-of at least --min-splats: movable by imajev's answer, not built in, not
-plants):
+of at least --min-splats: not built in, not plants. imajev's "movable" is
+too conservative to choose by; it calls a sofa 30% movable):
   1. orbit     object_orbit.py: the object alone along an orbit, depth + first frame
   2. generate  object_generate.py: LTX-2.3 in the local ComfyUI, guided by that
                depth (the scroll-studio technique), shows it from every side
@@ -42,8 +42,10 @@ def rebuild_matches(d, o):
     ids change whenever the objects are placed again, so the folder name alone doesn't say.)"""
     cams = json.loads((d / "cameras.json").read_text())
     centre = np.mean([np.asarray(c)[:3, 3] + cams["radius"] * np.asarray(c)[:3, 2] for c in cams["c2w"]], 0)  # looked at
-    return cams["label"] == o["label"] and \
-        np.linalg.norm(centre - np.asarray(o["box"]["center"])) < 0.5 * max(o["box"]["half"])
+    size = max(o["box"]["half"])
+    same_size = "box" not in cams or 0.75 <= size / max(cams["box"]["half"]) <= 1.33
+    return (cams["label"] == o["label"] and same_size
+            and np.linalg.norm(centre - np.asarray(o["box"]["center"])) < 0.5 * size)
 
 
 def venv_python(name):
@@ -71,16 +73,11 @@ def main():
     work_name = args.work or args.scene.split("-")[0]
     rebuild = HERE / "work" / work_name / "objects" / "rebuild"
     listing = json.loads((HERE / "viewer" / args.scene / "objects.json").read_text())["objects"]
-    def free_standing(o):
-        """imajev says a person could move it (identify_objects.py); without its answers, the kind decides."""
-        a = o.get("attributes") or {}
-        return a["movable"]["p"] >= 0.5 if "movable" in a else o["label"] not in BUILT_IN
-
     if args.objects:
         chosen = [o for o in listing if o["id"] in args.objects]
     else:
         chosen = sorted([o for o in listing if o["splats"] >= args.min_splats and o["label"] not in args.skip
-                         and o["label"] not in BUILT_IN and free_standing(o)], key=lambda o: -o["splats"])[:args.limit]
+                         and o["label"] not in BUILT_IN], key=lambda o: -o["splats"])[:args.limit]
     recon = venv_python(".venv-recon")
     log = rebuild / "rebuild.log"
     rebuild.mkdir(parents=True, exist_ok=True)

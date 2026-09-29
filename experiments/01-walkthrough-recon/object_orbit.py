@@ -112,7 +112,7 @@ def main():
     (out / "cameras.json").write_text(json.dumps({
         "object": obj["id"], "name": obj["name"], "label": obj["label"], "scene": args.scene, "W": W, "H": H,
         "K": K.cpu().tolist(), "c2w": [c.tolist() for c in cams], "radius": radius, "elevation": elev,
-        "attributes": obj.get("attributes")}, indent=1))
+        "attributes": obj.get("attributes"), "box": obj["box"]}, indent=1))
     print(f"{obj['name']}: {args.frames}-frame orbit at radius {radius:.3f} (elevation {elev:.0f} deg) -> {out}")
 
 
