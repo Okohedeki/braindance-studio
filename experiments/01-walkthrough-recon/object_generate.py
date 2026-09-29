@@ -24,8 +24,9 @@ sys.path.insert(0, str(HERE))
 import comfy_client  # noqa: E402
 
 FPS = 24
-NEGATIVE = ("people, hands, text, watermark, logo, extra objects, clutter, cuts, flicker, morphing, warped geometry, "
-            "melting, blurry, smeared detail, low poly, untextured grey shapes, cartoon, CGI")
+NEGATIVE = ("people, hands, text, watermark, logo, extra objects, clutter, turntable, rotating platform, pedestal, "
+            "podium, plinth, display stand, disc, base plate, cuts, flicker, morphing, warped geometry, melting, blurry, "
+            "smeared detail, low poly, untextured grey shapes, cartoon, CGI")
 
 
 def describe(cams):
@@ -33,10 +34,12 @@ def describe(cams):
     a = cams.get("attributes") or {}
     material = (a.get("material") or {}).get("value")
     made = f" made of {material}" if material else ""
-    return (f"A slow, steady 360-degree studio turntable shot of a single {label}{made}, standing alone on a plain light "
-            f"grey seamless studio background. The camera orbits smoothly around the {label} at a constant distance and "
-            f"height, keeping the whole {label} centred in frame from every side, including its back. Soft even studio "
-            f"lighting, realistic materials, fine surface detail, photoreal product video, sharp focus.")
+    # "turntable" made LTX invent a platform under objects it saw only in part (a chair, a bed's cover)
+    return (f"A slow, steady 360-degree camera orbit around a single {label}{made}, resting directly on the plain light "
+            f"grey floor of an empty seamless studio, with nothing under or around it. The camera orbits smoothly around "
+            f"the {label} at a constant distance and height, keeping the whole {label} centred in frame from every side, "
+            f"including its back. Soft even studio lighting, realistic materials, fine surface detail, photoreal product "
+            f"video, sharp focus.")
 
 
 def main():

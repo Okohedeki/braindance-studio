@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import scipy.ndimage as ndi
 import torch
 from PIL import Image
 
@@ -61,6 +62,19 @@ def main():
     ids = np.frombuffer((pkg / "objects.bin").read_bytes(), dtype="<u2")
     keep = torch.tensor(ids == args.object, device="cuda")
     s = {k: v[keep] for k, v in s.items() if k != "raw"}
+    # Drop floaters: splats of the object away from its main body (a stray shard in the first frame
+    # becomes a floating stick in every generated frame).
+    pts = s["means"].cpu().numpy()
+    cell = 2 * float(max(obj["box"]["half"])) / 12
+    ijk = np.floor((pts - pts.min(0)) / cell).astype(int)
+    occ = np.zeros(ijk.max(0) + 1, bool)
+    occ[tuple(ijk.T)] = True
+    labels, count = ndi.label(ndi.binary_dilation(occ))
+    per = np.bincount(labels[tuple(ijk.T)], minlength=count + 1)
+    main = per[1:] >= 0.1 * per[1:].max()
+    body = torch.tensor(main[labels[tuple(ijk.T)] - 1], device="cuda")
+    s = {k: v[body] for k, v in s.items()}
+    print(f"kept {int(body.sum())} of {len(body)} splats (dropped floaters)", flush=True)
 
     W, H = args.res
     f0 = meta["frames"][obj["bestFrame"]]

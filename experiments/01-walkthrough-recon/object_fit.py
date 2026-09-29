@@ -37,7 +37,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
+from scipy.spatial import ConvexHull
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
@@ -112,6 +113,19 @@ def main():
     rec_mean, rec_std = rec_pixels.mean(0), rec_pixels.std(0) + 1e-3
     print(f"{len(recorded)} recorded frames show {obj['name']}", flush=True)
 
+    corners = (np.asarray(obj["box"]["center"]) + (np.array([[i, j, k] for i in (-1, 1) for j in (-1, 1) for k in (-1, 1)])
+                                                     * np.asarray(obj["box"]["half"]) * 1.15) @ np.asarray(obj["box"]["axes"]))
+
+    def box_mask(c2w, K_, w, h):
+        """Pixels inside the projection of the object's box (15% margin)."""
+        w2c = np.linalg.inv(c2w)
+        pc = corners @ w2c[:3, :3].T + w2c[:3, 3]
+        uv = (pc[:, :2] / np.maximum(pc[:, 2:], 1e-6)) * [K_[0, 0], K_[1, 1]] + [K_[0, 2], K_[1, 2]]
+        hull = uv[ConvexHull(uv).vertices]
+        m = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(m).polygon([tuple(p) for p in hull], fill=1)
+        return np.asarray(m, bool)
+
     # Orbit frames and their object masks.
     W, H = int(cams["W"] * args.scale), int(cams["H"] * args.scale)
     K = torch.tensor(cams["K"], dtype=torch.float32, device="cuda")
@@ -124,6 +138,7 @@ def main():
                                  img[:, -4:].reshape(-1, 3)])
         bg = np.median(border, 0)
         mask = np.linalg.norm(img - bg, axis=2) > args.mask_threshold
+        mask &= box_mask(np.asarray(c2w), K.cpu().numpy(), W, H)  # nothing LTX adds around it (a platform) counts
         if len(rec_pixels) and mask.sum() > 50:
             # Colour-match the generated object to the recorded one.
             obj_px = img[mask]
