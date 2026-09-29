@@ -1,16 +1,17 @@
 """Plan the infer pass: views of what the recording never saw, grouped for SEVA.
 
-Samples cameras anywhere in the scene's observed free space (floor to ceiling,
-any direction, looking up as well as down), renders each from the current
-splats and keeps the ones where a real share of the screen is empty (nothing
-was reconstructed there) but enough of the known scene surrounds it to anchor
-a guess. Nearby views are grouped, because SEVA generates a group together and
-its guesses then agree with each other. Each group gets as inputs the recorded
-frames that see the most of the same surfaces from similar directions.
+SEVA guesses well next to what it is shown and falls apart far from it (a
+first plan that picked the emptiest views anywhere in the walkable space got
+shattered, crystal-like images indoors). So views are built from recorded
+camera positions: every --anchor-every training frames along the walk, the
+anchor's camera and a neighbour's are turned sideways, behind, up and down,
+plus one raised view looking down. Each group's inputs are the anchor and the
+frames around it (+-4, +-8), plus the frame elsewhere in the walk that sees
+the most of the same surfaces from similar directions.
 
 Writes work/<work>/infer/plan.json. Run with the reconstruction environment.
 
-  python unseen_plan.py --scene courtyard-roam --targets 240
+  python unseen_plan.py --scene courtyard-roam
 """
 
 import argparse
@@ -26,7 +27,7 @@ import torch.nn.functional as F
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from free_space import load_splats, render_depth  # noqa: E402
-from scene_space import FreeSpace, roam_cameras  # noqa: E402
+from scene_space import FreeSpace, look  # noqa: E402
 
 SCALE = 1 / 8  # render resolution for planning
 
@@ -62,17 +63,28 @@ def overlap_scores(pts, cam_pos, rec_c2w, rec_w2c, rec_K, rec_wh):
     return (inside * (to_rec * to_new[None]).sum(-1).clamp(min=0)).sum(1)
 
 
+# (yaw, pitch) in degrees for the anchor's camera and its neighbour's: what a
+# walkthrough camera, pointed along the walk, never looks at.
+TURNS_ANCHOR = [(60, 0), (-60, 0), (120, 0), (-120, 0), (180, 0), (0, 40), (0, -35)]
+TURNS_NEIGHBOUR = [(90, 0), (-90, 0), (150, 0), (-150, 0), (90, 35), (-90, 35), (180, -30)]
+
+
+def turned(c2w, up, yaw, pitch, rise=0.0):
+    fwd = c2w[:3, 2] - np.dot(c2w[:3, 2], up) * up
+    fwd /= np.linalg.norm(fwd)
+    side = np.cross(fwd, up)
+    a, b = math.radians(yaw), math.radians(pitch)
+    d = math.cos(a) * fwd + math.sin(a) * side
+    return look(c2w[:3, 3] + rise * up, math.cos(b) * d + math.sin(b) * up, up)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True, help="viewer package to extend, e.g. courtyard-roam")
     ap.add_argument("--work", help="work folder (default: scene name up to its first '-')")
-    ap.add_argument("--targets", type=int, default=240, help="views to generate")
+    ap.add_argument("--anchor-every", type=int, default=18, help="training frames between anchors")
     ap.add_argument("--inputs", type=int, default=6, help="recorded frames per SEVA group")
-    ap.add_argument("--frames-per-pass", type=int, default=21, help="SEVA's frames per pass (inputs + targets)")
-    ap.add_argument("--reach", type=float, default=1.5, help="x median surface distance from the recording path")
-    ap.add_argument("--min-empty", type=float, default=0.08)
-    ap.add_argument("--max-empty", type=float, default=0.9)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--rise", type=float, default=0.25, help="raised view: fraction of floor-to-ceiling")
     args = ap.parse_args()
 
     pkg = HERE / "viewer" / args.scene
@@ -94,54 +106,33 @@ def main():
     rec_wh = torch.tensor([[frames[i]["width"], frames[i]["height"]] for i in train_idx],
                           dtype=torch.float32, device="cuda")
 
-    # 1. Candidates, and how much of each is empty.
-    rng = np.random.default_rng(args.seed)
-    cands = roam_cameras(c2ws, train_idx, free, up, args.reach, args.targets * 6, rng, pitch=(-35, 70))
-    scored = []
-    for near, c2w in cands:
-        pts, empty = surface_points(s, mode, frame_with(frames[near], c2w))
-        if pts is not None and args.min_empty <= empty <= args.max_empty:
-            scored.append({"near": near, "c2w": c2w, "empty": empty, "pts": pts})
-    print(f"{len(cands)} candidate views, {len(scored)} with {args.min_empty:.0%}-{args.max_empty:.0%} empty screen")
-
-    # 2. Targets: emptiest first, not near-duplicates of each other.
-    scored.sort(key=lambda v: -v["empty"])
-    chosen = []
-    for v in scored:
-        p, d = v["c2w"][:3, 3], v["c2w"][:3, 2]
-        if all(np.linalg.norm(p - c["c2w"][:3, 3]) > 0.1 * free.unit or np.dot(d, c["c2w"][:3, 2]) < math.cos(math.radians(25))
-               for c in chosen):
-            chosen.append(v)
-        if len(chosen) == args.targets:
-            break
-
-    # 3. Groups of nearby views, each with the recorded frames that see the same surfaces.
-    per_group = args.frames_per_pass - args.inputs
-    left, groups = list(range(len(chosen))), []
-    while left:
-        seed = left.pop(0)
-        sp, sd = chosen[seed]["c2w"][:3, 3], chosen[seed]["c2w"][:3, 2]
-        left.sort(key=lambda k: np.linalg.norm(chosen[k]["c2w"][:3, 3] - sp) / free.unit
-                  + 0.5 * (1 - float(np.dot(chosen[k]["c2w"][:3, 2], sd))))
-        members = [seed] + left[:per_group - 1]
-        left = left[per_group - 1:]
-        score = sum(overlap_scores(chosen[k]["pts"], torch.tensor(chosen[k]["c2w"][:3, 3], dtype=torch.float32,
-                                                                   device="cuda"), rec_c2w, rec_w2c, rec_K, rec_wh)
-                    for k in members)
-        inputs = []
-        for j in torch.argsort(score, descending=True).tolist():
-            if all(abs(j - q) >= 4 for q in inputs):  # spread the inputs along the walk
-                inputs.append(j)
-            if len(inputs) == args.inputs:
-                break
-        groups.append({"inputs": [frames[train_idx[j]]["name"] for j in inputs],
-                       "targets": [{"c2w": chosen[k]["c2w"].tolist(), "empty": round(chosen[k]["empty"], 3),
-                                    "near": frames[chosen[k]["near"]]["name"]} for k in members]})
+    room = meta["freeSpace"].get("roomHeight", free.unit)
+    groups, chosen = [], []
+    for a in range(8, len(train_idx) - 8, args.anchor_every):
+        anchor, neighbour = c2ws[train_idx[a]], c2ws[train_idx[a + 4]]
+        views = [turned(anchor, up, y, p) for y, p in TURNS_ANCHOR]
+        views += [turned(neighbour, up, y, p) for y, p in TURNS_NEIGHBOUR]
+        raised = turned(anchor, up, 0, -30, args.rise * room)
+        views.append(raised if free.free(raised[:3, 3]) else turned(anchor, up, 0, -30, 0.5 * args.rise * room))
+        targets, score = [], torch.zeros(len(train_idx), device="cuda")
+        for c2w in views:
+            pts, empty = surface_points(s, mode, frame_with(frames[train_idx[a]], c2w))
+            targets.append({"c2w": c2w.tolist(), "empty": round(empty, 3), "near": frames[train_idx[a]]["name"]})
+            if pts is not None:
+                score += overlap_scores(pts, torch.tensor(c2w[:3, 3], dtype=torch.float32, device="cuda"),
+                                        rec_c2w, rec_w2c, rec_K, rec_wh)
+        inputs = sorted({min(max(a + o, 0), len(train_idx) - 1) for o in (-8, -4, 0, 4, 8)})
+        far = [j for j in torch.argsort(score, descending=True).tolist() if abs(j - a) > 12]
+        inputs += far[:args.inputs - len(inputs)]
+        groups.append({"anchor": frames[train_idx[a]]["name"],
+                       "inputs": [frames[train_idx[j]]["name"] for j in inputs], "targets": targets})
+        chosen += targets
 
     f0 = frames[0]
     plan = {"scene": args.scene, "work": work.name, "camera": {k: f0[k] for k in ("fx", "fy", "cx", "cy", "width", "height")},
             "targets": len(chosen), "groups": groups,
-            "medianEmpty": round(float(np.median([c["empty"] for c in chosen])), 3) if chosen else None}
+            "medianEmpty": round(float(np.median([c["empty"] for c in chosen])), 3) if chosen else None,
+            "method": "anchors: recorded cameras turned toward what the walk never faced"}
     (work / "infer").mkdir(parents=True, exist_ok=True)
     (work / "infer" / "plan.json").write_text(json.dumps(plan, indent=1))
     print(f"{len(chosen)} target views in {len(groups)} groups (median {plan['medianEmpty']:.0%} empty) "

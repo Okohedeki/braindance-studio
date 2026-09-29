@@ -46,6 +46,8 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--steps", type=int, default=50, help="diffusion steps per pass")
     ap.add_argument("--seed", type=int, default=23)
+    ap.add_argument("--only", type=int, nargs="*", help="generate just these groups (for a quick look); "
+                                                         "generated.json is written only when all are done")
     args = ap.parse_args()
 
     infer = HERE / "work" / args.work / "infer"
@@ -66,6 +68,8 @@ def main():
 
     generated = []
     for g, group in enumerate(plan["groups"]):
+        if args.only is not None and g not in args.only:
+            continue
         out = infer / "gen" / f"g{g:02d}"
         n_in, n_t = len(group["inputs"]), len(group["targets"])
         progress(stage="generate", message=f"Generating group {g + 1} of {len(plan['groups'])}", step=g,
@@ -103,6 +107,8 @@ def main():
             generated.append({"file": str((out / "samples-rgb" / f"{k:03d}.png").relative_to(infer)), "group": g,
                               "c2w": t["c2w"], "K": cams["K"][k], "W": cams["W"], "H": cams["H"],
                               "empty": t["empty"], "inputs": group["inputs"]})
+    if args.only is not None:
+        return
     (infer / "generated.json").write_text(json.dumps(generated, indent=1))
     progress(stage="generate", message=f"{len(generated)} views generated", step=len(plan["groups"]),
              steps=len(plan["groups"]))
