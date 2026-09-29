@@ -56,9 +56,27 @@ def upload(path):
 
 
 def ltx_depth_graph(prompt, negative, guide_video, first_image, frames, width, height, fps, prefix,
-                    guide_strength=0.6, keyframe_strength=1.0, seed=42):
+                    guide_strength=0.6, keyframe_strength=1.0, seed=42, keyframes=()):
     """LTX-2.3 22B distilled: the depth video steers camera and shape (IC-LoRA union control),
-    the first image sets the look."""
+    the first image sets the look. keyframes: [(uploaded image, frame index divisible by 8, strength)]
+    add softer image guides later in the video."""
+    graph = _ltx_graph(prompt, negative, guide_video, first_image, frames, width, height, fps, prefix,
+                       guide_strength, keyframe_strength, seed)
+    last = "addguide"
+    for k, (image, idx, strength) in enumerate(keyframes):
+        graph[f"kfimg{k}"] = {"class_type": "LoadImage", "inputs": {"image": image}}
+        graph[f"kf{k}"] = {"class_type": "LTXVAddGuide", "inputs": {
+            "positive": [last, 0], "negative": [last, 1], "vae": ["ckpt", 2], "latent": [last, 2],
+            "image": [f"kfimg{k}", 0], "frame_idx": int(idx), "strength": float(strength)}}
+        last = f"kf{k}"
+    graph["av"]["inputs"]["video_latent"] = [last, 2]
+    graph["guider"]["inputs"].update(positive=[last, 0], negative=[last, 1])
+    graph["crop"]["inputs"].update(positive=[last, 0], negative=[last, 1])
+    return graph
+
+
+def _ltx_graph(prompt, negative, guide_video, first_image, frames, width, height, fps, prefix,
+               guide_strength, keyframe_strength, seed):
     return {
         "ckpt": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": LTX["checkpoint"]}},
         "te": {"class_type": "LTXAVTextEncoderLoader", "inputs": {

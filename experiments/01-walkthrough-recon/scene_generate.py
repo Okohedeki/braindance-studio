@@ -4,8 +4,10 @@ Geometry-guided completion, step 2. For every path from scene_paths.py the
 depth frames become a heavily blurred guide video: where the recording never
 looked the reconstruction's depth is only a rough layout, so LTX gets the
 camera move and the coarse layout (floor, far wall) rather than the noise.
-The recorded frame is the first frame, and the prompt asks for the same
-place continuing as the camera turns. LTX-2.3 22B distilled with the union
+The recorded frame is the first frame, the scene's own render at the end
+of the turn is a soft keyframe (it keeps the layout the reconstruction and
+infer pass already have, while LTX sharpens it), and the prompt describes
+the place (scene_caption.py) and asks for it to continue as the camera turns. LTX-2.3 22B distilled with the union
 control IC-LoRA runs in the local ComfyUI (comfy_client.py), as scroll-studio
 does it.
 
@@ -31,22 +33,26 @@ NEGATIVE = ("people, person, hands, text, watermark, logo, cuts, scene change, f
             "melting walls, blurry, smeared detail, fisheye, cartoon, CGI, low quality")
 
 
-def prompt_for(cams):
+def prompt_for(cams, caption):
     c0, c1 = np.asarray(cams["c2w"][0]), np.asarray(cams["c2w"][-1])
     left = float((c1[:3, 2] - c0[:3, 2]) @ c0[:3, 0]) < 0  # the view swings toward the camera's -x
     side = "left" if left else "right"
-    return (f"A smooth, slow, steady camera pan: from the first frame the camera turns about {abs(cams['turnDeg'])} "
-            f"degrees to the {side} on the spot, continuing the same real place naturally and revealing the rest of "
-            f"the space around it. Photoreal real-estate walkthrough video, natural daylight, consistent lighting, "
-            f"materials and architecture, realistic detail, sharp focus.")
+    place = f"{caption.rstrip('.')}. " if caption else ""
+    return (f"{place}A smooth, slow, steady camera pan in this same place: from the first frame the camera turns "
+            f"about {abs(cams['turnDeg'])} degrees to the {side} on the spot, revealing the rest of the same space "
+            f"around it, which continues the same architecture, materials and light. Photoreal real-estate "
+            f"walkthrough video, natural daylight, consistent lighting, realistic detail, sharp focus.")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", required=True)
     ap.add_argument("--paths", nargs="*", help="path folders (default: every pNN)")
-    ap.add_argument("--guide-strength", type=float, default=0.45)
-    ap.add_argument("--blur", type=float, default=10.0, help="depth guide blur sigma at 1024 px")
+    ap.add_argument("--guide-strength", type=float, default=0.6)
+    ap.add_argument("--blur", type=float, default=6.0, help="depth guide blur sigma at 1024 px")
+    ap.add_argument("--end-strength", type=float, default=0.35,
+                    help="the scene's own render at the end of the turn as a soft keyframe (0 = none): keeps the "
+                         "layout the reconstruction and infer pass already have")
     ap.add_argument("--seed", type=int, default=7)
     args = ap.parse_args()
 
@@ -64,11 +70,15 @@ def main():
         subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-framerate", str(fps),
                         "-i", str(d / "depth" / "%04d.png"), "-vf", f"gblur=sigma={args.blur}",
                         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "12", str(guide)], check=True)
-        prompt = prompt_for(cams)
+        caption = (d / "caption.txt").read_text().strip() if (d / "caption.txt").exists() else ""
+        prompt = prompt_for(cams, caption)
+        end = (frames - 1) // 8 * 8
+        keyframes = ([(comfy_client.upload(str(d / "render" / f"{end:04d}.jpg")), end, args.end_strength)]
+                     if args.end_strength > 0 else [])
         graph = comfy_client.ltx_depth_graph(prompt, NEGATIVE, comfy_client.upload(str(guide)),
                                              comfy_client.upload(str(d / "first.png")), frames, W, H, fps,
                                              f"braindance_{args.work}_{d.name}_{int(time.time())}",
-                                             guide_strength=args.guide_strength, seed=args.seed)
+                                             guide_strength=args.guide_strength, seed=args.seed, keyframes=keyframes)
         t0 = time.time()
         images = comfy_client.run(graph)
         comfy_client.fetch(images, str(d / "gen"))
@@ -85,6 +95,7 @@ def main():
             sheet.paste(Image.open(d / "depth" / f"{k:04d}.png").convert("RGB").resize((w, h)), (c * w, 2 * h))
         sheet.save(d / "sheet.jpg", quality=88)
         (d / "generate.json").write_text(json.dumps({"prompt": prompt, "negative": NEGATIVE, "guideStrength": args.guide_strength,
+                                                     "endKeyframe": {"frame": end, "strength": args.end_strength},
                                                      "blur": args.blur, "seed": args.seed,
                                                      "seconds": round(time.time() - t0)}, indent=1))
         print(f"{d.name}: {len(images)} frames in {time.time() - t0:.0f}s (sheet: generated / scene / guide)", flush=True)
