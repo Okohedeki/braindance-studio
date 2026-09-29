@@ -3,8 +3,9 @@
   python rebuild_objects.py --scene courtyard-infer --out courtyard-objects
 
 For each chosen object (default: the largest --limit free-standing objects
-of at least --min-splats: not built in, not plants. imajev's "movable" is
-too conservative to choose by; it calls a sofa 30% movable):
+of at least --min-splats: not built in, not plants, and confirmed by imajev
+as what they're labelled. imajev's "movable" is too conservative to choose
+by; it calls a sofa 30% movable):
   1. orbit     object_orbit.py: the object alone along an orbit, depth + first frame
   2. generate  object_generate.py: LTX-2.3 in the local ComfyUI, guided by that
                depth (the scroll-studio technique), shows it from every side
@@ -68,6 +69,8 @@ def main():
     ap.add_argument("--min-splats", type=int, default=800)
     ap.add_argument("--skip", nargs="*", default=["plant"], help="labels not to rebuild")
     ap.add_argument("--limit", type=int, default=12, help="at most this many objects, largest first")
+    ap.add_argument("--min-confirmed", type=float, default=0.5,
+                    help="skip objects imajev confirms as their label with less than this probability")
     args = ap.parse_args()
 
     work_name = args.work or args.scene.split("-")[0]
@@ -76,8 +79,11 @@ def main():
     if args.objects:
         chosen = [o for o in listing if o["id"] in args.objects]
     else:
+        # imajev's "is it really a <label>?" gates the rebuild: a doubtful label (a "table" it thinks is a
+        # bench, 23%) is usually a fragment, and LTX grows the fragment's odd shape into the unseen sides
+        confirmed = lambda o: (o.get("attributes") or {}).get("isLabel", {}).get("p", 1.0) >= args.min_confirmed
         chosen = sorted([o for o in listing if o["splats"] >= args.min_splats and o["label"] not in args.skip
-                         and o["label"] not in BUILT_IN], key=lambda o: -o["splats"])[:args.limit]
+                         and o["label"] not in BUILT_IN and confirmed(o)], key=lambda o: -o["splats"])[:args.limit]
     recon = venv_python(".venv-recon")
     log = rebuild / "rebuild.log"
     rebuild.mkdir(parents=True, exist_ok=True)
@@ -135,7 +141,8 @@ def main():
               f"(covers {fit['vsRecording']['reconstructed']['coversRealMask']:.0%} -> "
               f"{fit['vsRecording']['rebuilt']['coversRealMask']:.0%})", flush=True)
     comfy_client.free()
-    run(recon, HERE / "object_replace.py", "--scene", args.scene, "--out", args.out, "--work", work_name)
+    run(recon, HERE / "object_replace.py", "--scene", args.scene, "--out", args.out, "--work", work_name,
+        "--objects", *[o["id"] for o in chosen])
     (rebuild / "summary.json").write_text(json.dumps(results, indent=1))
     print(f"done: open http://localhost:8790/?scene={args.out}/ (I shows what was generated)", flush=True)
 

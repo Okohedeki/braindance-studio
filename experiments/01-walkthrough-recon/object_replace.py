@@ -42,6 +42,7 @@ def main():
     ap.add_argument("--scene", required=True, help="viewer package the objects were rebuilt from")
     ap.add_argument("--out", required=True)
     ap.add_argument("--work", help="work folder (default: scene name up to its first '-')")
+    ap.add_argument("--objects", type=int, nargs="*", help="only these object ids (default: every finished rebuild)")
     args = ap.parse_args()
 
     src = HERE / "viewer" / args.scene
@@ -64,6 +65,8 @@ def main():
     by_id = {o["id"]: o for o in listing["objects"]}
     for pt in sorted((work / "objects" / "rebuild").glob("[0-9]*/object.pt")):
         oid = int(pt.parent.name)
+        if args.objects is not None and oid not in args.objects:
+            continue
         if oid not in by_id or not rebuild_matches(pt.parent, by_id[oid]):
             print(f"skipped {pt.parent}: made for another object (run rebuild_objects.py to sort the folders)")
             continue
