@@ -14,8 +14,9 @@ surfaces are. MoGe-2 gives one per image, depth and normals.
   - the free-roam views the Difix roam pass repaired (complete_difix.py
     --cameras roam, saved in views/): RGB and MoGe-2 normals, only where the
     trust map says the view shows recorded surfaces
-  - a small penalty on each splat's thinnest axis relative to its middle one,
-    so splats become discs that have a normal to align
+  - a small penalty on each splat's thinnest axis relative to its middle one
+    (the middle one held fixed in the penalty), so splats become discs that
+    have a normal to align; no splat may grow past 1.5x its starting size
 
 Same splats in the same order, so objects, free space and flags still apply.
 Writes viewer/<out> and refine.json; then run trust_map.py --scene <out>.
@@ -255,7 +256,14 @@ def main():
             wgt = torch.sigmoid(params["opacities"])
             return round(float((wgt * ((nrm @ up).abs() > math.cos(math.radians(30))).float()).sum() / wgt.sum()), 3)
 
-    before = {"heldOutPSNR": held_out(), "lyingFlat": facing()}
+    scale_cap = params["scales"].detach().max(1, keepdim=True).values + math.log(1.5)
+
+    def sizes():
+        with torch.no_grad():
+            big = torch.exp(params["scales"]).max(1).values[::7]
+            return [round(float(torch.quantile(big, q)), 4) for q in (0.5, 0.99)]
+
+    before = {"heldOutPSNR": held_out(), "lyingFlat": facing(), "splatSizeP50P99": sizes()}
     print(f"before: {before}", flush=True)
     t0 = time.time()
     for step in range(args.steps):
@@ -282,8 +290,10 @@ def main():
                 dm = v["depth"].to("cuda", non_blocking=True).float()
                 ok = valid & (depth > 0) & (dm > 0)
                 loss = loss + args.depth_weight * (torch.log(depth[ok]) - torch.log(dm[ok])).abs().mean()
+        # thin the shortest axis only: a ratio penalty let splats pass it by growing their middle axis
+        # (first version: 99th-percentile size x15, 36x the tile work, blur)
         sc = torch.exp(params["scales"]).sort(1).values
-        loss = loss + args.flat_weight * (sc[:, 0] / sc[:, 1].clamp(min=1e-8)).mean()
+        loss = loss + args.flat_weight * (sc[:, 0] / sc[:, 1].detach().clamp(min=1e-8)).mean()
         loss.backward()
         if use_gen:  # generation never overwrites what was recorded
             for q in params.values():
@@ -292,10 +302,12 @@ def main():
         for o in opts.values():
             o.step()
             o.zero_grad(set_to_none=True)
+        with torch.no_grad():  # no splat grows past 1.5x its starting size
+            params["scales"].copy_(torch.minimum(params["scales"], scale_cap))
         if step % 3000 == 0:
             print(f"  step {step}/{args.steps}", flush=True)
     minutes = (time.time() - t0) / 60
-    after = {"heldOutPSNR": held_out(), "lyingFlat": facing()}
+    after = {"heldOutPSNR": held_out(), "lyingFlat": facing(), "splatSizeP50P99": sizes()}
     print(f"after: {after} ({minutes:.1f} min)", flush=True)
 
     out = HERE / "viewer" / args.out
