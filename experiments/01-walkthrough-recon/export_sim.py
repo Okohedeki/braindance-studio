@@ -200,7 +200,11 @@ def main():
         a = o.get("attributes") or {}
         typical = TYPICAL.get(o["label"])
         if "movable" in a:
-            movable, movable_from = a["movable"]["p"] >= 0.5, f"imajev ({a['movable']['p']:.0%} movable)"
+            # imajev alone is too cautious (a sofa: 30%); weigh its evidence against what the kind usually is
+            prior = (0.8 if typical[0] else 0.1) if typical else 0.5
+            pm = float(np.clip(a["movable"]["p"], 0.01, 0.99))
+            post = 1 / (1 + (1 - prior) / prior * (1 - pm) / pm)
+            movable, movable_from = post >= 0.5, f"kind prior {prior:.0%} x imajev {pm:.0%} -> {post:.0%} movable"
         else:
             movable, movable_from = bool(typical and typical[0]), "typical for its kind"
         if o["label"] in NOT_BODIES or not movable:
@@ -257,9 +261,17 @@ def main():
         vols = np.array([8 * np.prod(h) for _, h, _ in boxes])
         com = np.average([c for c, _, _ in boxes], 0, weights=vols)
         if "mass" in a:
-            probs = a["mass"]["probabilities"]
-            kg = float(np.exp(sum(v * np.log(MASS_KG[k]) for k, v in probs.items()) / max(sum(probs.values()), 1e-6)))
-            mass_from = f"imajev: {a['mass']['value']} (probability-weighted)"
+            # imajev's mass classes weighed against the kind's typical mass (it calls a chair "over 50 kg")
+            classes = list(MASS_KG)
+            prior = np.ones(len(classes))
+            if typical:
+                t_ = int(np.argmin([abs(np.log(typical[1] / MASS_KG[c])) for c in classes]))
+                prior = np.array([0.6 if i == t_ else 0.15 if abs(i - t_) == 1 else 0.05 for i in range(len(classes))])
+            post = prior * np.array([a["mass"]["probabilities"].get(c, 0.0) + 1e-3 for c in classes])
+            post /= post.sum()
+            kg = float(np.exp(post @ np.log([MASS_KG[c] for c in classes])))
+            mass_from = (f"kind prior x imajev (imajev: {a['mass']['value']}): most likely {classes[int(post.argmax())]}"
+                         if typical else f"imajev: {a['mass']['value']} (probability-weighted)")
         else:
             kg, mass_from = float(typical[1] if typical else 5.0), "typical for its kind"
         mat = (a.get("material") or {}).get("value") or (typical[2] if typical else "wood")

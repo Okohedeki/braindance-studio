@@ -124,7 +124,8 @@ def main():
             run(recon, HERE / "object_orbit.py", "--scene", args.scene, "--object", o["id"])
         if not (d / "orbit.mp4").exists():
             run(sys.executable, HERE / "object_generate.py", "--work", work_name, "--object", o["id"])
-        if not (d / "object.pt").exists():
+        fitted = (d / "fit.json").exists() and "vsRecording" in json.loads((d / "fit.json").read_text())
+        if not (d / "object.pt").exists() or not fitted:  # fits from before the vs-recording check are redone
             comfy_client.free()  # the fit needs the GPU memory LTX holds
             run(recon, HERE / "object_fit.py", "--scene", args.scene, "--object", o["id"])
         fit = json.loads((d / "fit.json").read_text())
