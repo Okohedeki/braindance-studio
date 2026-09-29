@@ -17,9 +17,14 @@ Protocol
       objects placed by lift_objects.py in their colours; with a focus, that object is
       tinted and everything else is dimmed and greyed),
       "inferred" (optional bool: tint violet the splats added for what the recording never
-      saw, flagged in inferred.bin by unseen_bake.py)}
+      saw, flagged in inferred.bin by unseen_bake.py),
+      "trust" (optional bool: colour every pixel by where its splats came from, trust.bin
+      from trust_map.py: recorded, recorded once, filled, inferred, rebuilt),
+      "edits" (optional {object id: {"hide": bool, "matrix": 16 floats, row-major, a rigid
+      transform in the scene frame}}: move, turn or remove objects placed by lift_objects.py)}
   server -> client (binary): uint32 little-endian header length, JSON header
-      {"type": "frame", "id", "renderMs", "encodeMs", "splats"}, then JPEG bytes
+      {"type": "frame", "id", "renderMs", "encodeMs", "splats", and with trust "trust":
+      {class: share of the covered screen}}, then JPEG bytes
   server -> client (text) on failure: {"type": "error", "id", "message"}
 
 Only the newest request per connection is rendered: requests that arrive while
@@ -50,6 +55,36 @@ SCENE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_SIZE = 4096
 SH_C0 = 0.28209479177387814  # degree-0 spherical harmonic: colour = 0.5 + SH_C0 * dc
 INFERRED_TINT = (0.72, 0.45, 1.0)  # violet: guessed, not recorded
+# trust_map.py classes and their colours in the trust view
+TRUST = [("recorded", (0.2, 0.8, 0.35)), ("recorded once", (0.9, 0.82, 0.2)), ("filled", (1.0, 0.5, 0.15)),
+         ("inferred", INFERRED_TINT), ("rebuilt", (0.25, 0.6, 1.0))]
+
+
+def quat_mul(a, b):
+    """Hamilton product of wxyz quaternions, a [4] with b [N, 4]."""
+    w0, x0, y0, z0 = a
+    w1, x1, y1, z1 = b.unbind(1)
+    return torch.stack([w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1, w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+                        w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1, w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1], 1)
+
+
+def matrix_to_quat(m):
+    """wxyz quaternion of a 3x3 rotation matrix (numpy)."""
+    t = np.trace(m)
+    if t > 0:
+        r = np.sqrt(1 + t) * 2
+        q = [0.25 * r, (m[2, 1] - m[1, 2]) / r, (m[0, 2] - m[2, 0]) / r, (m[1, 0] - m[0, 1]) / r]
+    else:
+        i = int(np.argmax(np.diag(m)))
+        j, k = (i + 1) % 3, (i + 2) % 3
+        r = np.sqrt(1 + m[i, i] - m[j, j] - m[k, k]) * 2
+        q = [0.0] * 4
+        q[0] = (m[k, j] - m[j, k]) / r
+        q[1 + i] = 0.25 * r
+        q[1 + j] = (m[j, i] + m[i, j]) / r
+        q[1 + k] = (m[k, i] + m[i, k]) / r
+    q = np.asarray(q)
+    return q / np.linalg.norm(q)
 
 
 def read_ply(path):
@@ -92,6 +127,7 @@ class Scene:
         self.objects = None  # (file mtime, per-splat ids, palette); loaded on first use
         self.tinted = (None, None)  # (key, colours)
         self.inferred = None  # per-splat flags from inferred.bin; loaded on first use
+        self.trust = None  # (file mtime, per-splat class) from trust.bin; loaded on first use
         # Optional per-splat observation cones (observed_directions.py).
         self.observed = None
         if "observed" in meta and (VIEWER / name / meta["observed"]["file"]).is_file():
@@ -138,6 +174,44 @@ class Scene:
             self.inferred = torch.tensor(flags.astype(bool), device="cuda") if len(flags) == self.count else False
         return None if self.inferred is False else self.inferred
 
+    def load_trust(self):
+        """Per-splat provenance class from trust_map.py, reloaded when it's rewritten, or None."""
+        path = self.dir / "trust.bin"
+        if not path.is_file():
+            return None
+        mtime = os.stat(path).st_mtime_ns
+        if self.trust is None or self.trust[0] != mtime:
+            data = np.frombuffer(path.read_bytes(), np.uint8)
+            if len(data) != 2 * self.count:
+                raise ValueError("trust.bin does not match scene.ply; run trust_map.py again")
+            self.trust = (mtime, torch.tensor(data[0::2].astype(np.int64), device="cuda"))
+        return self.trust[1]
+
+    def edited(self, edits, opacities):
+        """Means, quats and opacities with objects moved, turned or hidden."""
+        if not edits:
+            return self.means, self.quats, opacities
+        loaded = self.load_objects()
+        if loaded is None:
+            raise ValueError("this scene has no objects to edit")
+        ids = loaded[1]
+        means, quats, opacities = self.means.clone(), self.quats.clone(), opacities.clone()
+        for key, e in edits.items():
+            sel = ids == int(key)
+            if e.get("hide"):
+                opacities[sel] = 0
+                continue
+            if "matrix" in e:
+                m = np.asarray(e["matrix"], np.float64).reshape(4, 4)
+                rot = m[:3, :3]
+                if abs(np.linalg.det(rot) - 1) > 1e-3:
+                    raise ValueError("edit matrix must be a rigid transform")
+                r = torch.tensor(rot, dtype=torch.float32, device="cuda")
+                t = torch.tensor(m[:3, 3], dtype=torch.float32, device="cuda")
+                means[sel] = means[sel] @ r.T + t
+                quats[sel] = quat_mul(torch.tensor(matrix_to_quat(rot), dtype=torch.float32, device="cuda"), quats[sel])
+        return means, quats, opacities
+
     def colors_for(self, objects, inferred=False):
         """Splat colours with objects tinted (show) or one object picked out (focus),
         and inferred splats tinted violet."""
@@ -171,20 +245,37 @@ class Scene:
         self.tinted = (key, colors)
         return colors
 
-    def render(self, c2w, K, w, h, fade=None, objects=None, inferred=False):
-        """Image [H, W, 3] and alpha [H, W, 1] with the rasteriser the scene was trained with."""
-        opacities = self.opacities_for(c2w[:3, 3], fade)
-        colors = self.colors_for(objects, inferred)
+    def render(self, c2w, K, w, h, fade=None, objects=None, inferred=False, trust=False, edits=None):
+        """Image [H, W, 3], alpha [H, W, 1] and, with trust, {class: share of the covered screen},
+        with the rasteriser the scene was trained with."""
+        means, quats, opacities = self.edited(edits, self.opacities_for(c2w[:3, 3], fade))
+        colors, sh_degree, shares = self.colors_for(objects, inferred), self.sh_degree, None
+        cls = self.load_trust() if trust else None
+        if trust and cls is None:
+            raise ValueError("no trust map for this scene; run trust_map.py")
+        if cls is not None:
+            # class colours shaded by the splat's own brightness, plus one channel per class to measure the screen
+            rgb = (0.5 + SH_C0 * self.colors[:, 0]).clamp(0, 1)
+            luma = (rgb * torch.tensor([0.299, 0.587, 0.114], device="cuda")).sum(1, keepdim=True)
+            palette = torch.tensor([c for _, c in TRUST], device="cuda")
+            onehot = torch.nn.functional.one_hot(cls, len(TRUST)).float()
+            colors, sh_degree = torch.cat([palette[cls] * (0.3 + 0.7 * luma), onehot], 1), None
         viewmat = torch.linalg.inv(c2w)[None]
         with torch.no_grad():
             if self.primitive == "2dgs":
-                img, alpha, *_ = rasterization_2dgs(self.means, self.quats, self.scales, opacities, colors,
-                                                    viewmat, K[None], w, h, sh_degree=self.sh_degree)
+                img, alpha, *_ = rasterization_2dgs(means, quats, self.scales, opacities, colors,
+                                                    viewmat, K[None], w, h, sh_degree=sh_degree)
             else:
-                img, alpha, _ = rasterization(self.means, self.quats, self.scales, opacities, colors,
-                                              viewmat, K[None], w, h, sh_degree=self.sh_degree,
+                img, alpha, _ = rasterization(means, quats, self.scales, opacities, colors,
+                                              viewmat, K[None], w, h, sh_degree=sh_degree,
                                               rasterize_mode=self.mode)
-        return img[0], alpha[0]
+        img, alpha = img[0], alpha[0]
+        if cls is not None:
+            weights = img[..., 3:].reshape(-1, len(TRUST)).sum(0)
+            total = float(weights.sum())
+            shares = {name: round(float(v) / total, 4) if total > 0 else 0 for (name, _), v in zip(TRUST, weights)}
+            img = img[..., :3]
+        return img, alpha, shares
 
 
 class Renderer:
@@ -214,7 +305,11 @@ class Renderer:
         bg = torch.tensor(req.get("background", [0, 0, 0]), dtype=torch.float32, device="cuda")
         t0 = time.perf_counter()
         with torch.no_grad():
-            img, alpha = s.render(c2w, K, w, h, req.get("fade"), req.get("objects"), bool(req.get("inferred")))
+            edits = req.get("edits") or None
+            if edits is not None and not isinstance(edits, dict):
+                raise ValueError("edits must be {object id: edit}")
+            img, alpha, shares = s.render(c2w, K, w, h, req.get("fade"), req.get("objects"), bool(req.get("inferred")),
+                                          bool(req.get("trust")), edits)
             # Composite over the background here (gsplat 1.5.3's backgrounds= argument
             # fails a shape check in packed mode).
             img = img + (1 - alpha) * bg
@@ -225,6 +320,8 @@ class Renderer:
         t2 = time.perf_counter()
         header = {"type": "frame", "id": req["id"], "renderMs": round((t1 - t0) * 1000, 2),
                   "encodeMs": round((t2 - t1) * 1000, 2), "splats": s.count}
+        if shares is not None:
+            header["trust"] = shares
         return header, jpeg
 
 
@@ -237,7 +334,7 @@ async def main():
     renderer = Renderer()
     pool = ThreadPoolExecutor(max_workers=1)  # one GPU, one queue
     hello = json.dumps({"type": "hello", "backend": f"gsplat {gsplat_version}",
-                        "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects", "inferred"]})
+                        "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects", "inferred", "trust", "edits"]})
     loop = asyncio.get_running_loop()
 
     async def handler(ws):
