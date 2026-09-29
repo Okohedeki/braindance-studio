@@ -58,7 +58,7 @@ This is the experience the project exists to deliver. Each step notes where its 
 | First scene | A PhysTwin sample (three depth cameras; code is MIT-licensed, dataset license still to confirm) |
 | Hardware | RTX 4090 runs simulation and inference locally |
 | Unseen areas | Fill once, then render in real time. No per-frame generation |
-| Infer feature | Optional plugin, not in the core. HY-World 2.0 is a test backend only because of its license; the default should be permissively licensed |
+| Infer feature | Implemented as the infer pass (2026-09-28): Stable Virtual Camera generates views of what the recording never saw, MoGe-2 depth lifts them into new splats flagged as inferred, and the viewer can tint them (I). SEVA is non-commercial (weights and outputs); chosen for quality because the project isn't used commercially. Still baked once, then rendered; never per frame |
 | Platform | Windows first. macOS and Linux marked untested until verified |
 | Rendering | Two renderers on one timeline: GPU mode streams frames from a local gsplat worker (reference quality, about 55–60 fps at 1080p on the 4090); browser mode (Spark) is the fallback with no worker. Chosen 2026-09-24 after measuring Spark about 6 dB below the reference renderer |
 | Walkthrough video | Experiment 01 shows a walkthrough of a still space can be rebuilt and explored (Pexels clips). Importing a walkthrough video is a feature (chosen 2026-09-27): `import_walkthrough.py` runs every stage in one command, a pre-flight check reports footage that won't work before hours of compute, and shots that don't connect are reported and left out, never silently merged |

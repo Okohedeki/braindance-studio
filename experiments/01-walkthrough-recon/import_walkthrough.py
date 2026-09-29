@@ -17,10 +17,13 @@ resumes where it left off):
   6. fill 2    a higher, wider path pass -> viewer/<name>-filled2
   7. fill 3    roam pass: views anywhere in the free space, floor to ceiling,
                any direction, then consolidation -> viewer/<name>-roam
-  8. objects   scan_objects.py: SAM 3.1 tracks for --objects prompts, placed
+  8. infer     infer_unseen.py: SEVA generates views of what the recording
+               never saw, lifted into new splats flagged as inferred
+               -> viewer/<name>-infer (needs .venv-seva; skip with --no-infer)
+  9. objects   scan_objects.py: SAM 3.1 tracks for --objects prompts, placed
                in 3D (skip with --no-objects)
-  9. compare   roam_flythrough.py: free-roam flythrough, <name> vs <name>-roam
- 10. report    work/<name>/import_report.json and the viewer link
+ 10. compare   roam_flythrough.py: free-roam flythrough, <name> vs the final scene
+ 11. report    work/<name>/import_report.json and the viewer link
 
 Standard library only; each stage runs in the environment it needs
 (.venv-recon, .venv-sam3). Logs go to work/<name>/import.log. Expect about
@@ -138,7 +141,7 @@ def clear_solve(work):
 def stage_minutes(log_path):
     """Minutes per stage from the log, so resumed imports report every stage."""
     minutes = {}
-    for m in re.finditer(r"\] (\d+/10 [^:\n]+): done in ([\d.]+) min", log_path.read_text(encoding="utf-8")):
+    for m in re.finditer(r"\] (\d+/1[01] [^:\n]+): done in ([\d.]+) min", log_path.read_text(encoding="utf-8")):
         minutes[m.group(1)] = float(m.group(2))
     return minutes
 
@@ -155,6 +158,7 @@ def main():
     ap.add_argument("--credit", help="who made the videos and under what licence (shown in the viewer)")
     ap.add_argument("--objects", nargs="*", default=DEFAULT_OBJECTS, help="object prompts to scan for")
     ap.add_argument("--no-objects", action="store_true")
+    ap.add_argument("--no-infer", action="store_true", help="skip estimating what the recording never saw")
     ap.add_argument("--force", action="store_true", help="continue even if the pre-flight check says it won't work")
     ap.add_argument("--wait-for-gpu", action="store_true", help="wait until the GPU has room before the heavy stages")
     args = ap.parse_args()
@@ -204,7 +208,7 @@ def main():
         # A report that found problems doesn't count, unless the user chose to go ahead anyway.
         return report_path.exists() and (args.force or all(r["ok"] for r in json.loads(report_path.read_text()).values()))
 
-    imp.stage("check", "2/10 check the videos", checked, check)
+    imp.stage("check", "2/11 check the videos", checked, check)
 
     if args.wait_for_gpu:
         wait_for_gpu(imp)
@@ -239,10 +243,10 @@ def main():
                 break
         solve_path.write_text(json.dumps({"chosen": tried[-1], "attempts": tried}, indent=1, default=str))
 
-    imp.stage("solve", "3/10 camera solve", solve_path.exists, solve)
+    imp.stage("solve", "3/11 camera solve", solve_path.exists, solve)
     chosen = json.loads(solve_path.read_text())["chosen"]
     base_ckpt = work / "run" / "ckpts" / "ckpt_29999_rank0.pt"
-    imp.stage("build", "3/10 splat training and export",
+    imp.stage("build", "3/11 splat training and export",
               lambda: base_ckpt.exists() and scene_meta(name) is not None,
               lambda: imp.run(HERE / "reconstruct.py", "--scene", name, "--clips", *clips,
                               "--frame-step", chosen["frame_step"], "--source-fps", fps, "--matcher", matcher,
@@ -252,18 +256,18 @@ def main():
         imp.say(f"  clips {connectivity['dropped']} share no views with the rest and were left out")
 
     # 4. walls
-    imp.stage("walls", "4/10 free space for the viewer's walls",
+    imp.stage("walls", "4/11 free space for the viewer's walls",
               lambda: "freeSpace" in (scene_meta(name) or {}),
               lambda: imp.run(HERE / "free_space.py", "--scene", name, "--voxels", 320))
 
     # 5-7. fills; each builds on the previous one and is packaged with its own free space
     fills = [
-        ("fill1", "5/10 fill pass 1 (near the path)", name, "run", f"{name}-filled", 0.35,
+        ("fill1", "5/11 fill pass 1 (near the path)", name, "run", f"{name}-filled", 0.35,
          [], "filled by complete_difix.py: raised, pitched and turned views near the recording path"),
-        ("fill2", "6/10 fill pass 2 (higher, wider)", f"{name}-filled", f"run_{name}-filled", f"{name}-filled2", 0.5,
+        ("fill2", "6/11 fill pass 2 (higher, wider)", f"{name}-filled", f"run_{name}-filled", f"{name}-filled2", 0.5,
          ["--rises", 0.3, 0.6, 0.75, 0.9, "--yaw", 45, "--every", 3, "--steps", 2000],
          "filled by complete_difix.py (two path passes) up to 90% of the free headroom"),
-        ("fill3", "7/10 fill pass 3 (free roam)", f"{name}-filled2", f"run_{name}-filled2", f"{name}-roam", 1.0,
+        ("fill3", "7/11 fill pass 3 (free roam)", f"{name}-filled2", f"run_{name}-filled2", f"{name}-roam", 1.0,
          ["--cameras", "roam", "--reach", 0.3, 0.6, 1.0, 1.5, "--views", 360, "--steps", 3000, "--final-steps", 24000,
           "--novel-prob", 0.5, "--probes", 24, "--relocate", "--needle", 0.01],
          "filled by complete_difix.py: two path passes, then views anywhere in the free space, floor to ceiling, "
@@ -278,16 +282,24 @@ def main():
         imp.stage(key, title, lambda out=out: "navigation" in (scene_meta(out) or {}), fill)
     final = f"{name}-roam"
 
+    # 8. infer: generated guesses for what no frame showed, flagged in the scene
+    if not args.no_infer and venv_python(".venv-seva").exists():
+        imp.stage("infer", "8/11 estimate what the recording never saw (SEVA)",
+                  lambda: "inferred" in (scene_meta(f"{name}-infer") or {}),
+                  lambda: imp.run(HERE / "infer_unseen.py", "--scene", final, "--run", f"run_{final}",
+                                  "--out", f"{name}-infer", python=sys.executable))
+        final = f"{name}-infer"
+
     # 8. objects
     if not args.no_objects and args.objects:
-        imp.stage("objects", "8/10 objects",
+        imp.stage("objects", "9/11 objects",
                   lambda: set(args.objects) <= set((scene_meta(final) or {}).get("objects", {}).get("prompts", [])),
                   lambda: imp.run(HERE / "scan_objects.py", "--scene", final, "--prompts", *args.objects,
                                   python=sys.executable))
 
     # 9. compare
     compare = HERE / "work" / "captures" / f"{name}_roam_compare.mp4"
-    imp.stage("compare", "9/10 free-roam flythrough, before and after filling", compare.exists,
+    imp.stage("compare", "10/11 free-roam flythrough, before and after filling", compare.exists,
               lambda: imp.run(HERE / "roam_flythrough.py", "--variants", name, final, "--labels", "reconstructed",
                               "filled", "--out", compare.relative_to(HERE),
                               "--sheet", compare.with_suffix(".jpg").relative_to(HERE)))
@@ -304,11 +316,12 @@ def main():
         "heldOutPSNR": {k: (v.get("final") or v["stages"][-1])["heldOutPSNR"] for k, v in fill_logs.items()},
         "probeRepairDistance": {"before": fill_logs.get("fill3", {}).get("probesBefore"),
                                 "after": fill_logs.get("fill3", {}).get("probesAfter")},
-        "objects": meta.get("objects", {}).get("count"), "minutes": stage_minutes(imp.log_path),
+        "objects": meta.get("objects", {}).get("count"), "inferredSplats": meta.get("inferred", {}).get("count"),
+        "minutes": stage_minutes(imp.log_path),
         "viewer": f"http://localhost:8790/?scene={final}/",
     }
     (work / "import_report.json").write_text(json.dumps(report, indent=1))
-    imp.say(f"10/10 done: {report['framesRegistered']} of {extracted} frames placed, "
+    imp.say(f"11/11 done: {report['framesRegistered']} of {extracted} frames placed, "
             f"{report['objects'] or 0} objects. Open {report['viewer']}")
 
 

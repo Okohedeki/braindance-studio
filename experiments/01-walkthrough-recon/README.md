@@ -318,3 +318,44 @@ ALIKED extraction takes 27 s; LightGlue matching 15 min (SIFT: about 1 min). COL
 - A sky model (a background colour or environment map fitted to the frames), so outdoor views don't show black.
 - A higher splat cap for a scene this size (1M now).
 - For narrow interiors, keeping free-roam views further from walls, or letting the viewer's walls stop the camera closer to the path there.
+
+## Estimating what the recording never saw (infer pass)
+
+The fill passes only repair and sharpen views of surfaces the camera did see. Difix is a repair model, the fine-tuning only reshapes splats that already exist, and views mostly of empty space were skipped. So empty space (sky, what's behind a wall the camera never faced, the far side of the stairwell) stayed black or smeared. The infer pass generates that content and adds it to the scene as new splats, labelled as inferred.
+
+`infer_unseen.py --scene courtyard-roam --run run_courtyard-roam --out courtyard-infer` (also stage 8 of `import_walkthrough.py`):
+
+1. **Plan** (`unseen_plan.py`, reconstruction env). Every 18 training frames along the walk, the anchor's camera and a neighbour's are turned sideways (±60–150°), behind, up and down, plus one raised view looking down: 15 targets. The inputs are the anchor, frames ±4 and ±8 along the walk, and the frame elsewhere that sees the most of the same surfaces.
+2. **Generate** (`unseen_generate.py`, `.venv-seva`). [Stable Virtual Camera (SEVA) v1.1](https://github.com/Stability-AI/stable-virtual-camera), 1.3B parameters, generates each group's 15 views together from its 6 inputs and cameras, at 1024×576. Because a group is generated together, its guesses agree with each other.
+3. **Bake** (`unseen_bake.py`, reconstruction env). For each generated view:
+   - MoGe-2 estimates depth, given the camera's field of view.
+   - That depth is scaled to the rendered depth in a band around the empty parts of the view, where new surfaces have to meet known ones.
+   - Empty pixels become new splats. Sky, which has no depth, goes on a far dome.
+
+   Then everything is fine-tuned, with each generated view teaching only its empty parts plus a thin border. New splats are flagged in `inferred.npy`.
+4. **Package** (`package_filled.py`). Writes `inferred.bin` (one byte per splat) and an `inferred` entry in `scene.json`. The viewer's **Show what's inferred (I)** tints those splats violet (GPU mode).
+
+**Setup.** `.venv-seva` reuses the system Python 3.11 and PyTorch 2.13, and adds only `roma`, `imageio-ffmpeg` and `utils3d_moge` (all installed with `--no-deps`); MoGe also needs `utils3d_moge` in `.venv-recon`. The SEVA weights (5.06 GB, gated on Hugging Face) come under Stability's non-commercial licence, and so do its outputs. SEVA also needs the OpenCLIP ViT-H-14 image encoder (3.94 GB) and the Stable Diffusion 2.1 VAE; the official SD 2.1 repo is no longer downloadable, so `apply_windows_patches.py` points SEVA at the sd2-community mirror (identical checksums). The same script lets SEVA's attention fall back from FlashAttention on Windows. MoGe-2 is 1.32 GB.
+
+**What went wrong on the way:**
+
+| Attempt | What happened |
+|---|---|
+| Targets = the emptiest views anywhere in the walkable space | SEVA produced shattered, crystal-like images indoors. It guesses well next to what it is shown and falls apart far from it. Fixed by planning from recorded cameras. |
+| Training on whole generated views; depth scale fitted to the whole view | 39 of 285 views lifted (365k new splats). MoGe and the scene disagreed by ~40%, since the known surfaces are blurry. SEVA's softer guesses also blurred the walkway's potted trees and indoor walls. Fixed by aligning depth in a band around the empty parts and teaching only the empty parts. |
+
+**Courtyard result** (`viewer/courtyard-infer`, `work/captures/courtyard-infer_compare.mp4`):
+- **Generation:** 285 views in 19 groups, 35 min (2.1 min and 16.2 GB per group).
+- **Bake:** 7.8 min. 109 views lifted into 790k inferred splats, added to the existing 1M; 103 views had empty screen to teach.
+- **Held-out PSNR from the recording cameras:** 28.14 → 28.85 dB (half resolution). The recorded content improved rather than degraded.
+- **Side by side:**
+  - Voids that were black (sky, over the courtyard walls, parts of the terrace) now show sky, trees, foliage and buildings.
+  - Recorded areas look as before.
+  - The new content is rough: low detail, and glassy shard artifacts where guesses from different groups, or the depth, disagree.
+  - Indoor blur is unchanged, because the pass only fills empty screen.
+
+**What would help next:**
+- Generate longer trajectories per pass (SEVA's two-pass trajectory mode), so neighbouring groups agree.
+- Keep only lifted points that several generated views agree on.
+- A sharper generator than SEVA's 576p.
+- A separate, gentle pass that lets the generated views sharpen blurry but covered regions.

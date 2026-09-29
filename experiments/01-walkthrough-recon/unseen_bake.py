@@ -3,13 +3,16 @@
 For each view SEVA generated (unseen_generate.py):
   1. render the current splats' depth and coverage from that camera;
   2. MoGe-2 estimates the generated image's depth (told the camera's field of
-     view), scaled to match the rendered depth where the scene already has
-     surfaces (views whose depth disagrees too much are not lifted);
+     view), scaled to match the rendered depth in a band just around the
+     empty parts, where new surfaces have to meet the known ones (a scale fitted
+     to the whole view was off by ~40%, the known surfaces being blurry);
   3. pixels where the scene was empty become new splats at that depth, in the
      generated colour. Sky, which MoGe leaves without depth, goes onto a far
-     dome around the scene.
+     dome around the scene (no depth scale needed).
 Then everything is fine-tuned on the recorded frames plus the generated
-views, so new and old splats settle together.
+views, each generated view teaching only its empty parts (and a thin border):
+trained on whole, SEVA's softer guesses of already-reconstructed areas blurred
+them.
 
 New splats are marked inferred (inferred.npy next to the checkpoint); the
 packaged scene carries inferred.bin so the viewer can show what was guessed.
@@ -89,7 +92,11 @@ def main():
     cams = np.array([np.asarray(f["c2w"])[:3, 3] for f in meta["frames"]])
     centre = cams.mean(0)
     sky_radius = 4 * max(np.linalg.norm(cams - centre, axis=1).max(), meta["freeSpace"]["medianDepth"])
-    new_pts, new_rgb, new_size, lifted, skipped = [], [], [], 0, []
+    new_pts, new_rgb, new_size, lifted, skipped, teach = [], [], [], 0, [], []
+
+    def dilate(mask, r):
+        return F.max_pool2d(mask[None, None].float(), 2 * r + 1, stride=1, padding=r)[0, 0] > 0
+
     t0 = time.time()
     for n, v in enumerate(views):
         img = np.asarray(Image.open(infer / v["file"]).convert("RGB"))
@@ -102,17 +109,22 @@ def main():
             fov_x = math.degrees(2 * math.atan(W / (2 * float(K[0, 0]))))
             m = moge.infer(torch.tensor(img / 255, dtype=torch.float32, device="cuda").permute(2, 0, 1), fov_x=fov_x)
         depth_m, valid = m["depth"], m["mask"].bool() & torch.isfinite(m["depth"])
-        known = (alpha > 0.95) & valid & (depth_r > 0)
-        if known.float().mean() < 0.05:
-            skipped.append((n, "too little known surface to anchor the depth"))
-            continue
-        ratio = torch.log(depth_r[known] / depth_m[known])
-        scale = float(torch.exp(ratio.median()))
-        spread = float((ratio - ratio.median()).abs().median())
-        if spread > args.max_disagree:
-            skipped.append((n, f"depth disagrees with the scene (spread {spread:.2f})"))
-            continue
         empty = alpha < 0.5
+        teach.append(dilate(empty, 4).cpu())  # where this view may supervise training
+        # Depth scale from a band around the empty parts, else from all known surface.
+        known = (alpha > 0.95) & valid & (depth_r > 0)
+        band = dilate(empty, 12) & ~empty & known
+        anchor = band if band.sum() >= 300 else known if known.float().mean() >= 0.05 else None
+        scale = None
+        if anchor is not None:
+            ratio = torch.log(depth_r[anchor] / depth_m[anchor])
+            spread = float((ratio - ratio.median()).abs().median())
+            if spread <= args.max_disagree:
+                scale = float(torch.exp(ratio.median()))
+            else:
+                skipped.append((n, f"depth disagrees with the scene (spread {spread:.2f})"))
+        else:
+            skipped.append((n, "too little known surface to anchor the depth"))
         grid = torch.zeros_like(empty)
         grid[::args.stride, ::args.stride] = True
         ys, xs = torch.nonzero(empty & grid, as_tuple=True)
@@ -120,8 +132,8 @@ def main():
             continue
         rays = torch.stack([(xs + 0.5 - K[0, 2]) / K[0, 0], (ys + 0.5 - K[1, 2]) / K[1, 1], torch.ones_like(xs, dtype=torch.float32)], 1)
         dirs = F.normalize(rays @ c2w[:3, :3].T, dim=1)
-        z = depth_m[ys, xs] * scale
-        solid = valid[ys, xs]
+        z = depth_m[ys, xs] * (scale or 0.0)
+        solid = valid[ys, xs] & (scale is not None)
         pts = torch.where(solid[:, None], (rays * z[:, None]) @ c2w[:3, :3].T + c2w[:3, 3],
                           c2w[:3, 3] + dirs * sky_radius)
         # Sky only above the horizon; empty screen below it with no depth is left alone.
@@ -178,7 +190,9 @@ def main():
                 for i in train_idx]
     recorded = [(c, K, w, h, load(parser.image_paths[i], w, h)) for (c, K, w, h), i in zip(recorded, train_idx)]
     novel = [(torch.tensor(v["c2w"], dtype=torch.float32, device="cuda"), torch.tensor(v["K"], dtype=torch.float32, device="cuda"),
-              v["W"], v["H"], load(infer / v["file"], v["W"], v["H"])) for v in views]
+              v["W"], v["H"], load(infer / v["file"], v["W"], v["H"]), m.pin_memory())
+             for v, m in zip(views, teach) if m.float().mean() > 0.005]
+    print(f"{len(novel)} generated views have empty screen to teach", flush=True)
     scene_scale = parser.scene_scale * 1.1
     lrs = {"means": 1.6e-5 * scene_scale, "scales": 2.5e-3, "quats": 5e-4, "opacities": 2.5e-2,
            "sh0": 1.25e-3, "shN": 1.25e-3 / 20}
@@ -199,12 +213,20 @@ def main():
     t0 = time.time()
     for step in range(args.steps):
         use_novel = random.random() < args.novel_prob
-        c2w, K, w, h, gt = random.choice(novel if use_novel else recorded)
+        c2w, K, w, h, gt, *mask = random.choice(novel if use_novel else recorded)
         pred, _ = render(params, c2w, K, w, h, mode_="RGB", grad=True)
+        pred = pred.clamp(0, 1)
         gt = gt.to("cuda", non_blocking=True).float() / 255
-        l1 = (pred.clamp(0, 1) - gt).abs().mean()
-        ssim = fused_ssim(pred.clamp(0, 1).permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None], padding="valid")
-        loss = (0.8 * l1 + 0.2 * (1 - ssim)) * (args.novel_weight if use_novel else 1.0)
+        if mask:
+            # Outside what this view may teach, the target is the render itself: no pull either way.
+            m = mask[0].to("cuda", non_blocking=True)[..., None].float()
+            gt = m * gt + (1 - m) * pred.detach()
+            share = float(m.mean())
+        else:
+            share = 1.0
+        l1 = (pred - gt).abs().mean()
+        ssim = fused_ssim(pred.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None], padding="valid")
+        loss = (0.8 * l1 + 0.2 * (1 - ssim)) / share * (args.novel_weight if use_novel else 1.0)
         loss.backward()
         for o in opts.values():
             o.step()
@@ -215,7 +237,8 @@ def main():
 
     torch.save({"step": 0, "splats": {k: v.detach() for k, v in params.items()}}, out_dir / "ckpts" / "ckpt_filled.pt")
     np.save(out_dir / "inferred.npy", inferred)
-    log = {"source": str(ckpt), "views": len(views), "lifted": lifted, "skipped": skipped[:50], "newSplats": n_new,
+    log = {"source": str(ckpt), "views": len(views), "lifted": lifted, "skipped": skipped, "newSplats": n_new,
+           "teachingViews": len(novel),
            "oldSplats": n_old, "skyRadius": round(float(sky_radius), 3), "steps": args.steps,
            "heldOutPSNR": {"before": before, "after": after}, "trainMinutes": round((time.time() - t0) / 60, 1)}
     (out_dir / "bake.json").write_text(json.dumps(log, indent=1))
