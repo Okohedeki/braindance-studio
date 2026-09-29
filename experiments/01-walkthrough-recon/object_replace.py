@@ -26,6 +26,29 @@ from gpu_render_server import read_ply  # noqa: E402
 from rebuild_objects import rebuild_matches  # noqa: E402
 
 
+def held_out_psnr(scene, work, scale=0.5):
+    """Mean PSNR of a package over every other held-out recorded frame (the scenes' own test split)."""
+    sys.path.insert(0, str(HERE.parents[1] / "tools" / "gsplat-src" / "examples"))
+    from datasets.colmap import Parser
+    from PIL import Image
+    import gpu_render_server as g
+    parser = Parser(data_dir=str(work / "train"), factor=1, normalize=True, test_every=8)
+    idx = np.arange(len(parser.image_names))
+    sc, vals = g.Scene(scene), []
+    for i in idx[idx % 8 == 0][::2]:
+        Wf, Hf = parser.imsize_dict[parser.camera_ids[i]]
+        w, h = int(Wf * scale) // 8 * 8, int(Hf * scale) // 8 * 8
+        K = torch.tensor(parser.Ks_dict[parser.camera_ids[i]], dtype=torch.float32, device="cuda").clone()
+        K[0] *= w / Wf
+        K[1] *= h / Hf
+        img, _, _ = sc.render(torch.tensor(parser.camtoworlds[i], dtype=torch.float32, device="cuda"), K, w, h)
+        gt = torch.from_numpy(np.asarray(Image.open(parser.image_paths[i]).convert("RGB").resize((w, h), Image.BICUBIC)).copy())
+        vals.append(float(-10 * torch.log10(((img.clamp(0, 1) - gt.cuda().float() / 255) ** 2).mean())))
+    del sc
+    torch.cuda.empty_cache()
+    return round(float(np.mean(vals)), 2)
+
+
 def write_ply(path, cols):
     names = list(cols)
     n = len(cols[names[0]])
@@ -117,6 +140,13 @@ def main():
                                      "orbit guided by each object's own depth, fitted together with the recorded frames "
                                      "it appears in; flagged 2 in inferred.bin where the rebuild grew what wasn't seen")
     (out / "scene.json").write_text(json.dumps(meta, indent=1))
+    # The per-object check only looks inside each object's mask; this one looks at whole recorded frames.
+    if (work / "train").exists():
+        before, after = held_out_psnr(args.scene, work), held_out_psnr(args.out, work)
+        meta["heldOutPSNR"] = {"beforeRebuild": before, "afterRebuild": after}
+        (out / "scene.json").write_text(json.dumps(meta, indent=1))
+        warn = "  WARNING: the rebuilt objects hurt recorded views" if after < before - 0.5 else ""
+        print(f"held-out PSNR of the whole scene: {before} -> {after} dB{warn}")
     print(f"{len(rebuilt)} objects swapped in: {n} -> {len(ids_out)} splats -> {out}")
 
 
