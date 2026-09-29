@@ -9,3 +9,4 @@ tools/
 experiments/*/data/
 experiments/*/work/
 experiments/*/viewer/*/
+experiments/*/sim/
