@@ -5,7 +5,8 @@ gradient of the frame with respect to the splat's colour: how much it
 actually shows there) says which frames really saw it; they, and the widest
 angle between the directions they saw it from, say how well the recording
 pinned it down. Together with the flags the later passes left (inferred.bin:
-1 = the infer pass, 2 = grown by an object rebuild) every splat gets a class:
+1 = the infer pass, 2 = grown by an object rebuild, 3 = geometry-guided
+completion) every splat gets a class:
 
   0 recorded       seen by >= --well frames from >= --parallax degrees apart
   1 recorded once  seen, but by few frames or from nearly one direction:
@@ -14,6 +15,8 @@ pinned it down. Together with the flags the later passes left (inferred.bin:
                    (Difix-repaired novel views) or the optimiser
   3 inferred       the infer pass (SEVA views of what the recording never saw)
   4 rebuilt        grown by an object rebuild (LTX orbit) for unseen sides
+  5 completed      drawn by geometry-guided completion (LTX along the scene's
+                   own depth, scene_bake.py) where no frame had looked
 
 Writes viewer/<scene>/trust.bin (per splat: class, frames that saw it,
 capped at 255) and trust.json (classes, counts, method). The GPU render
@@ -37,7 +40,7 @@ sys.path.insert(0, str(HERE))
 from free_space import camera, load_splats  # noqa: E402
 from gsplat.rendering import rasterization  # noqa: E402
 
-CLASSES = {0: "recorded", 1: "recorded once", 2: "filled", 3: "inferred", 4: "rebuilt"}
+CLASSES = {0: "recorded", 1: "recorded once", 2: "filled", 3: "inferred", 4: "rebuilt", 5: "completed"}
 
 
 def main():
@@ -84,6 +87,7 @@ def main():
     cls = np.where(views_np == 0, 2, np.where((views_np >= args.well) & (angle_np >= args.parallax), 0, 1)).astype(np.uint8)
     cls[flags == 1] = 3
     cls[flags == 2] = 4
+    cls[flags == 3] = 5
     (pkg / "trust.bin").write_bytes(np.stack([cls, np.minimum(views_np, 255).astype(np.uint8)], 1).tobytes())
     opac = s["opacities"].cpu().numpy()
     counts = {CLASSES[k]: int((cls == k).sum()) for k in CLASSES}

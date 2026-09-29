@@ -19,7 +19,7 @@ Protocol
       "inferred" (optional bool: tint violet the splats added for what the recording never
       saw, flagged in inferred.bin by unseen_bake.py),
       "trust" (optional bool: colour every pixel by where its splats came from, trust.bin
-      from trust_map.py: recorded, recorded once, filled, inferred, rebuilt),
+      from trust_map.py: recorded, recorded once, filled, inferred, rebuilt, completed),
       "edits" (optional {object id: {"hide": bool, "matrix": 16 floats, row-major, a rigid
       transform in the scene frame}}: move, turn or remove objects placed by lift_objects.py)}
   server -> client (binary): uint32 little-endian header length, JSON header
@@ -57,7 +57,7 @@ SH_C0 = 0.28209479177387814  # degree-0 spherical harmonic: colour = 0.5 + SH_C0
 INFERRED_TINT = (0.72, 0.45, 1.0)  # violet: guessed, not recorded
 # trust_map.py classes and their colours in the trust view
 TRUST = [("recorded", (0.2, 0.8, 0.35)), ("recorded once", (0.9, 0.82, 0.2)), ("filled", (1.0, 0.5, 0.15)),
-         ("inferred", INFERRED_TINT), ("rebuilt", (0.25, 0.6, 1.0))]
+         ("inferred", INFERRED_TINT), ("rebuilt", (0.25, 0.6, 1.0)), ("completed", (0.2, 0.85, 0.85))]
 
 
 def quat_mul(a, b):
