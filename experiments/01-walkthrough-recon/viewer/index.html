@@ -822,7 +822,8 @@ function describeObject(o) {
   const parts = [];
   if (a.material?.value) parts.push(a.material.value);
   if (a.mass?.value) parts.push(a.mass.value);
-  if (a.movable) parts.push(a.movable.p >= 0.5 ? "movable" : "fixed");
+  // imajev's raw answer; it's cautious (a sofa: 30%), so show the number rather than a verdict
+  if (a.movable) parts.push(`${Math.round(100 * a.movable.p)}% movable`);
   if (o.rebuilt) parts.push("rebuilt whole");
   return parts.join(" · ");
 }
