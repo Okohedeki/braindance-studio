@@ -93,6 +93,10 @@
   #objectList button[aria-pressed="true"] { background: var(--panel-2); box-shadow: inset 2px 0 0 var(--cyan); }
   #objectList i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
   #objectList .time { margin-left: auto; color: var(--muted); font-size: 11px; }
+  #editRow { display: grid; gap: var(--space-2); margin-bottom: var(--space-2); }
+  #editRow[hidden] { display: none; }
+  #editRow .edit-buttons { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+  #editRow button { padding: 4px 2px; font-size: 12px; }
   #scanForm { display: flex; gap: var(--space-1); margin-top: var(--space-2); }
   #scanForm input { flex: 1; width: 0; min-width: 0; font: inherit; color: var(--text); background: var(--bg);
     border: 1px solid var(--line); border-radius: var(--radius); padding: 4px 8px; }
@@ -173,6 +177,19 @@
       <h2>Objects</h2>
       <label class="check" title="Tint, box and tag the objects found in the scene (O)"><input type="checkbox" id="objectsToggle"> Show objects (O)</label>
       <ul id="objectList" aria-label="Objects in the scene"></ul>
+      <div id="editRow" hidden>
+        <div class="edit-buttons" role="group" aria-label="Edit the picked object">
+          <button id="editRemove" title="Take it out of the scene (Delete)">Remove</button>
+          <button id="editTurnL" title="Turn it 15° to the left ([)">Turn ⟲</button>
+          <button id="editTurnR" title="Turn it 15° to the right (])">Turn ⟳</button>
+          <button id="editReset" title="Put it back where it was recorded">Reset</button>
+          <button id="editAway" title="Push it away from you">Away</button>
+          <button id="editToward" title="Pull it toward you">Toward</button>
+          <button id="editLeft" title="Slide it to your left">Left</button>
+          <button id="editRight" title="Slide it to your right">Right</button>
+        </div>
+        <p class="hint" id="editHint"></p>
+      </div>
       <form id="scanForm" hidden>
         <input id="scanPrompt" type="text" maxlength="40" autocomplete="off" placeholder="Scan for… (e.g. lamp)" aria-label="Object to scan for">
         <button type="submit" id="scanBtn">Scan</button>
@@ -666,7 +683,7 @@ function gpuRequest(w, h, background, quality = 90) {
   return { type: "render", id: gpu.nextId++, scene: sceneName, c2w, fx: fy, fy, cx: w / 2, cy: h / 2,
     width: w, height: h, quality, background,
     objects: objects.list.length ? { show: objects.show, focus: objects.focus || null } : undefined,
-    inferred: showInferred || undefined, trust: showTrust || undefined };
+    inferred: showInferred || undefined, trust: showTrust || undefined, edits: editsRequest() };
 }
 
 // GPU frames are rendered at the canvas's pixel size, capped at ~2.5 MP.
@@ -681,7 +698,7 @@ function requestGpuFrame() {
   const [w, h] = gpuSize();
   const req = gpuRequest(w, h, [BG.r, BG.g, BG.b]);
   const key = `${w}x${h}:${req.c2w.map((v) => v.toFixed(5)).join(",")}:${camera.fov.toFixed(3)}`
-    + `:${objects.version}:${objects.show}:${objects.focus}:${showInferred}:${showTrust}`;
+    + `:${objects.version}:${objects.show}:${objects.focus}:${showInferred}:${showTrust}:${objects.editVersion}`;
   if (key === gpu.lastKey) return;
   gpu.lastKey = key;
   gpu.inFlight = req.id;
@@ -790,7 +807,10 @@ function buildObjectViews() {
     tag.style.setProperty("--c", `rgb(${o.color.join(",")})`);
     tag.onclick = () => focusObject(objects.focus === o.id ? 0 : o.id);
     $("objTags").append(tag);
-    o.view = { box, tag, center, top: center.clone().addScaledVector(e3, hz) };
+    const top = center.clone().addScaledVector(e3, hz);
+    o.view = { box, tag, center: center.clone(), top: top.clone(),
+               baseMatrix: box.matrix.clone(), baseCenter: center, baseTop: top };
+    if (objects.edits?.has(o.id)) applyEditView(o);
   }
 }
 
@@ -875,6 +895,7 @@ function updateObjectViews() {
   }
   $("objectsToggle").checked = objects.show;
   updateObjectsHint();
+  updateEditUI();
 }
 
 function updateObjectsHint() {
@@ -891,6 +912,75 @@ function updateObjectsHint() {
   }
   if ($("objectsHint").textContent !== text) $("objectsHint").textContent = text;
 }
+
+// Editing the world: move, turn or take out an object. The GPU worker applies
+// the rigid transform to the object's splats; nothing is saved. What was behind
+// an object was never recorded, so moving it uncovers a hole or the infer
+// pass's estimate (T shows which).
+const SCENE_UP = new THREE.Vector3(...meta.worldUp).normalize();
+objects.edits = new Map();
+objects.editVersion = 0;
+function editMatrix(o, e) {
+  const c = new THREE.Vector3(...o.box.center);
+  return new THREE.Matrix4().makeTranslation(c.x + e.offset.x, c.y + e.offset.y, c.z + e.offset.z)
+    .multiply(new THREE.Matrix4().makeRotationAxis(SCENE_UP, THREE.MathUtils.degToRad(e.yaw)))
+    .multiply(new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z));
+}
+function editsRequest() {
+  const out = {};
+  for (const [id, e] of objects.edits) {
+    if (e.hide) out[id] = { hide: true };
+    else if (e.yaw || e.offset.lengthSq()) {
+      const m = editMatrix(objects.byId.get(id), e).elements;  // column-major
+      out[id] = { matrix: [m[0], m[4], m[8], m[12], m[1], m[5], m[9], m[13], m[2], m[6], m[10], m[14], 0, 0, 0, 1] };
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+function applyEditView(o) {
+  const e = objects.edits.get(o.id);
+  const m = e && !e.hide ? editMatrix(o, e) : new THREE.Matrix4();
+  o.view.box.matrix.multiplyMatrices(m, o.view.baseMatrix);
+  o.view.center.copy(o.view.baseCenter).applyMatrix4(m);
+  o.view.top.copy(o.view.baseTop).applyMatrix4(m);
+}
+function editFocused(fn) {
+  const o = objects.byId.get(objects.focus);
+  if (!o) return;
+  if (!objects.edits.has(o.id)) objects.edits.set(o.id, { hide: false, yaw: 0, offset: new THREE.Vector3() });
+  fn(objects.edits.get(o.id));
+  objects.editVersion++;
+  applyEditView(o);
+  updateEditUI();
+}
+function nudge(away, right) {
+  const d = new THREE.Vector3();
+  camera.getWorldDirection(d);
+  d.transformDirection(rootInverse);
+  d.addScaledVector(SCENE_UP, -d.dot(SCENE_UP)).normalize();
+  const r = new THREE.Vector3().crossVectors(d, SCENE_UP).normalize();
+  editFocused((e) => e.offset.addScaledVector(d, away * 0.1 * unit).addScaledVector(r, right * 0.1 * unit));
+}
+function updateEditUI() {
+  const o = objects.byId.get(objects.focus);
+  $("editRow").hidden = !o;
+  if (!o) return;
+  const e = objects.edits.get(o.id);
+  $("editRemove").textContent = e?.hide ? "Restore" : "Remove";
+  for (const id of ["editTurnL", "editTurnR", "editAway", "editToward", "editLeft", "editRight"]) $(id).disabled = !!e?.hide;
+  const edited = [...objects.edits.values()].filter((v) => v.hide || v.yaw || v.offset.lengthSq()).length;
+  $("editHint").textContent = !gpuActive() ? "Editing objects needs the GPU renderer."
+    : `${edited ? `${edited} object${edited > 1 ? "s" : ""} edited (not saved). ` : ""}`
+      + "What was behind it was never recorded: moving it uncovers a hole or an estimate (T shows which).";
+}
+$("editRemove").onclick = () => editFocused((e) => { e.hide = !e.hide; });
+$("editTurnL").onclick = () => editFocused((e) => { e.yaw += 15; });
+$("editTurnR").onclick = () => editFocused((e) => { e.yaw -= 15; });
+$("editReset").onclick = () => editFocused((e) => { e.hide = false; e.yaw = 0; e.offset.set(0, 0, 0); });
+$("editAway").onclick = () => nudge(1, 0);
+$("editToward").onclick = () => nudge(-1, 0);
+$("editLeft").onclick = () => nudge(0, -1);
+$("editRight").onclick = () => nudge(0, 1);
 
 // Pick out one object: jump to the recorded frame that shows it best and, in
 // free mode, look at it from that frame's camera position.
@@ -1065,6 +1155,9 @@ window.addEventListener("keydown", (e) => {
   else if (k === "i" && meta.inferred) { $("inferredToggle").click(); }
   else if (k === "t" && trustInfo) { $("trustToggle").click(); }
   else if (k === "Escape" && objects.focus) { focusObject(0); }
+  else if ((k === "Delete" || k === "Backspace") && objects.focus) { $("editRemove").click(); }
+  else if (k === "[" && objects.focus) { $("editTurnL").click(); }
+  else if (k === "]" && objects.focus) { $("editTurnR").click(); }
   else if (!locked && "wasdqe".includes(k)) keys.add(k);
   if (e.key === "Shift") keys.add("Shift");
 });
