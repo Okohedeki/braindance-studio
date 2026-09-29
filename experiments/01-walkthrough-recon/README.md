@@ -445,6 +445,7 @@ The recording sees most objects from one side. `rebuild_objects.py --scene court
    - The fit uses the recorded frames it appears in, masked by its SAM masks, plus the generated orbit, colour-matched to the recording and trusted only inside its projected box. Each orbit frame gets a small camera correction.
    - The check: PSNR against the recording inside the object's real masks, reconstructed object alone vs rebuilt object alone.
 4. **Swap** (`object_replace.py`). The rebuilt objects replace their old splats in a new package; splats grown for unseen sides are flagged 2 ("rebuilt").
+5. **Integrate.** 3,000 steps on every recorded training frame, whole frames. Only the rebuilt objects' splats train, plus the opacity of other splats inside their boxes: pieces of the object that SAM's masks missed, which may fade. Then the whole scene's held-out PSNR is compared before and after the swap.
 
 **Which objects.** The largest free-standing objects (not built in, not plants) that imajev confirms are what their label says (at least 50%). imajev's "movable" is too cautious to choose by. On the courtyard, the confirmation gate left out "table 2", which imajev thinks is a bench (23%). Sofa 2 was left out by hand: its reconstruction is only the wooden frame.
 
@@ -452,14 +453,14 @@ The recording sees most objects from one side. `rebuild_objects.py --scene court
 
 | Object | vs recording, reconstructed → rebuilt | Covers its real mask |
 |---|---|---|
-| sofa 1 | 19.6 → 31.2 dB | 92% → 100% |
-| table 1 (side table) | 20.2 → 30.0 dB | 89% → 100% |
+| sofa 1 | 19.6 → 31.3 dB | 92% → 100% |
+| table 1 (side table) | 20.2 → 30.1 dB | 89% → 100% |
 | vase 1 | 23.1 → 29.6 dB | 97% → 100% |
 | bed 1 | 20.8 → 29.4 dB | 87% → 99% |
-| chair 1 (two chairs) | 28.4 → 28.3 dB | 98% → 100% |
-| coffee maker 1 | 18.5 → 27.2 dB | 90% → 100% |
+| chair 1 (two chairs) | 28.4 → 28.5 dB | 98% → 100% |
+| coffee maker 1 | 18.5 → 26.9 dB | 90% → 100% |
 
-The scene goes from 1.79M to 1.87M splats; 5% are now "rebuilt" in the trust map. The PSNR only checks that the rebuilt object still matches what was recorded (and fills its holes there). Nothing can score the sides nobody filmed, so `work/captures/courtyard_rebuild_isolated.jpg` shows each object alone from the front, side, back, other side and above, before and after:
+The scene goes from 1.79M to 1.86M splats; 5% are now "rebuilt" in the trust map. **Whole scene, held out: 28.85 → 28.70 dB** (half resolution). The PSNR only checks that the rebuilt object still matches what was recorded (and fills its holes there). Nothing can score the sides nobody filmed, so `work/captures/courtyard_rebuild_isolated.jpg` shows each object alone from the front, side, back, other side and above, before and after:
 - **Sofa 1:** from the side, back and above the reconstruction is broken fragments. Rebuilt, it is a complete sofa from every side: arms, legs, back frame, cushions.
 - **Coffee maker:** side views go from smears to a solid body.
 - **Vase:** solid from every side, but the wrong shape: LTX gave it horns and handles it doesn't have.
@@ -476,6 +477,10 @@ Moving a rebuilt object in the viewer leaves no ghost behind, unlike the reconst
 | A stray shard in the first frame became a floating stick in every generated frame | Drop splats away from the object's main body (voxel components) before the orbit |
 | The orbit kept the recording camera's distance: a vase was a few pixels tall | Frame the object, since it is rendered alone |
 | An old fit's folder was keyed by an object id that changed when objects were placed again | Rebuild folders are matched to objects by kind, orbit centre and size |
+| The per-object check (19.6 → 31.2 dB for the sofa) hid a whole-scene loss: held-out PSNR fell 28.85 → 25.82 dB. A hallway frame went 22.3 → 14.8 dB under a smear of chair splats: seeds had grown or drifted where no orbit frame looks (`work/captures/courtyard_rebuild_haze.jpg`) | Seeds stay inside the object's box and at most a quarter of its size. In recorded frames the object is penalised wherever it would stand in front of the rest of the scene outside its mask. The swap now reports the whole scene's held-out PSNR. That brought it back to 27.12 dB |
+| Still 1.7 dB down: pieces of the sofa the masks missed doubled up with the rebuilt sofa, and the hallway frame (the chair isn't in it, so the object fit never saw it) kept its smear | The integration pass on whole recorded frames: 28.70 dB |
+
+**Lesson:** a generated object has to be checked in the whole scene, not just inside its own mask.
 
 **The limit:** a rebuild is only as good as the object it starts from.
 - "Bed 1" is only its striped cover plus part of a lamp, so LTX drew a crumpled cover, not a bed.
@@ -491,3 +496,43 @@ Pick an object in the viewer (Objects list or its tag) to get **Remove / Turn �
 Two limits show straight away:
 - Splats of an object that SAM's masks missed stay behind as a ghost (the sofa's armrest). Rebuilt objects (above) are complete, so they move cleanly.
 - What was behind an object was never recorded. Moving it uncovers a hole, or the infer pass's estimate, and the trust view says which.
+
+## Geometry-guided completion: a video model on the scene's own geometry
+
+The infer pass (SEVA) filled what the recording never saw, but its guesses are soft shards. `complete_scene.py --scene courtyard-objects --out courtyard-complete` runs scroll-studio's technique at scene scale, and keeps the result honest:
+
+1. **Paths** (`scene_paths.py`). At an anchor every 6 recorded frames, 11 turns (±30°...180°) are rendered small in the trust view. The chosen turns are the ones showing the most never-recorded pixels, and the anchors are at least 18 frames apart. Turns facing something too close (median depth under half the median surface distance) are rejected, and a near plane at 0.2 × that distance keeps floaters out of the guide. Each path holds on the recorded view for 12 frames, turns smoothly over 73, drifts a little toward the turn's end where free space allows, then holds.
+   - Courtyard: only the outdoor start of the walk has large unseen areas (60–89% of the best turn); indoors, every anchor's best turn shows under 25% unrecorded. 6 paths (anchors at frames 2, 22, 50, 70, 91, 111).
+   - Along each path: the scene's depth (scroll-studio encoding), its own render, and per pixel the share that was recorded.
+2. **Caption** (`scene_caption.py`). Qwen3.5-4B describes the place in the recorded first frame, e.g. "An outdoor modern patio with minimalist wooden furniture, light gray cushions... under a dark slatted ceiling".
+3. **Generate** (`scene_generate.py`). LTX-2.3 with the union-control IC-LoRA:
+   - the first frame is the recorded frame;
+   - the depth guide is blurred (σ 6) at strength 0.6;
+   - the scene's own render at frame 96 is a soft keyframe (0.35);
+   - the prompt is the caption plus the camera move.
+
+   97 frames at 1024×576 take about 70 s per path (229 s when models load).
+4. **Fit** (`scene_bake.py`). The scene trains on its 355 recorded frames and the 582 generated frames, with two rules:
+   - a generated frame only teaches pixels the recording never saw (its target elsewhere is the render itself);
+   - splats the trust map calls recorded, or recorded once, are frozen (664k of 1.86M).
+
+   Generated frames are colour-matched to the scene where they overlap recorded pixels, and each gets a small camera correction. 12,000 steps, 8.5 min. Splats whose colour moved are flagged 3 ("completed" in the trust view).
+
+**What went wrong on the way:**
+
+| Attempt | What happened |
+|---|---|
+| Guide blurred at σ 10, strength 0.45; prompt = camera move only | LTX turned the terrace's unseen side into an indoor furniture showroom. The rough geometry behind the start of the walk isn't a strong enough guide on its own. Fixed with the caption and the end keyframe on the scene's own render, which keeps its layout (sky above, garden wall, planters) while LTX sharpens it. |
+| Turns planned without a near plane | One turn walked the camera into splats a metre away and the depth guide was near-field noise. |
+
+**Courtyard result** (`viewer/courtyard-complete`):
+- **Held-out PSNR from the recording cameras: 28.70 → 29.04 dB.** Nothing recorded got worse; the unrecorded splats now fit around what was recorded.
+- **Never-recorded pixels of the generated frames:** the scene matches them at 25.7 dB (was 18.3).
+- **Trust map:** 29% recorded, 8% recorded once, 12% filled, 32% inferred, 3% rebuilt, 15% completed (281k splats changed).
+- **Side by side** (`work/captures/courtyard_completion_v1.jpg`: before, after, trust view, from the first version of this fit): on the paths, brown and green smears become a garden with trees, planters, a wall and sky. Off the paths it partly carries over: two of four test turns go from smear to trees and sky, one stays a smear, one barely changes. The trust view marks 35–78% of these views "completed".
+- **What it isn't:** photoreal. The completed garden is soft and dreamlike. LTX turns white smears into white patio furniture that probably isn't there, and one path (p03) drifts toward armchairs. A sharpness measure (variance of the Laplacian in never-recorded pixels) dropped, because the old shards counted as detail. It can't tell noise from structure, so no sharpness claim is made here.
+
+**What would help next:**
+- More, longer paths with overlap, so neighbouring paths agree.
+- Letting completion add splats where the scene has none (it only re-colours and reshapes what the infer pass placed).
+- A multi-view check that drops generated content paths disagree on.
