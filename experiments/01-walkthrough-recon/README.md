@@ -359,3 +359,85 @@ The fill passes only repair and sharpen views of surfaces the camera did see. Di
 - Keep only lifted points that several generated views agree on.
 - A sharper generator than SEVA's 576p.
 - A separate, gentle pass that lets the generated views sharpen blurry but covered regions.
+
+## Identifying every object (a Jev-style classifier)
+
+`identify_objects.py --scene courtyard-infer` names, checks, tracks and describes every object, with calibrated answers instead of free text. The classifier is [imajev-4b](https://github.com/mohit67890/imajev) (Apache-2.0), an open Jev-style decision model: Qwen3.5-4B with a LoRA adapter and a shipped calibration. It answers typed questions (yes/no, choice, score, multi-label) with probabilities and an explicit "can't tell" share. It runs from `tools/imajev` as a local HTTP server on port 8792 (PyTorch backend) while it's needed.
+
+1. **List** (`objects_list.py`). Qwen3.5-4B, the same base without the adapter, names every kind of physical object in 20 keyframes spread over the walk. Names are lower-cased and made singular, and surfaces (wall, floor, sky...) are dropped. Courtyard: 82 kinds in 2.2 min.
+2. **Verify.** imajev checks every name against every keyframe with one multi-label question per 32 names ("which of these can be seen?") and keeps kinds it confirms at 0.7 or more somewhere. Courtyard: 76 of 82 kept in 6.9 min. It rejected car, fence, ottoman, chimney, shutter and stair railing.
+3. **Consolidate.** Verification is honest about presence, but tracking every variant separately is slow and makes duplicates. Variants are grouped under a general kind: olive tree and palm tree under "tree", framed artwork and wall art under "artwork", coffee table, side table, desk and nightstand under "table". Surfaces and building structure are dropped: floors, decking, paving, ceilings, beams, panels, doorways, the building. Courtyard: 76 names become 33 kinds; 16 dropped.
+4. **Track and place.** SAM 3.1 follows each kind through the clips and `lift_objects.py` places the tracks on the splats (see "Finding the objects"). Courtyard: 27 new kinds in 48 min (6 were already tracked), 87 objects.
+5. **Classify.** For each object, a crop of the recorded frame that shows it best (from its own mask) gets up to seven questions:
+   - which of its kind's variants it is;
+   - whether it really is that kind;
+   - material (10 classes);
+   - movable by hand;
+   - rigid;
+   - mass (4 classes);
+   - whether the whole object is in view.
+
+   Answers go into `objects.json` as `attributes`, each with its probabilities and "can't tell" share. Courtyard: 87 objects in 1.7 min. The viewer shows them on each object's tag and tooltip.
+
+**How good the answers are.**
+- **The kind is right:** olive tree vs palm tree, sliding door, side table vs coffee table, snake plant vs potted plant.
+- **The "is it really a ..." check catches mislabels:**
+  - "artwork 1" is more likely a television (is-artwork 0.56);
+  - "window 2" is a mirror (0.08);
+  - "table 2" is a bench (0.23).
+- **Physical answers are weak on their own:** a sofa is 30% movable, a chair "over 50 kg". Real to sim (below) therefore weighs them against a prior for the kind rather than using them raw.
+
+## Trust layer: where every pixel came from
+
+A world model that fills in the unseen should say so, pixel by pixel. `trust_map.py` gives every splat a class:
+
+| Class | Meaning | Courtyard (share of splats) |
+|---|---|---|
+| recorded | seen by 4+ recorded frames spanning 6°+ | 31% |
+| recorded once | seen, but by few frames or from one direction: real colour, weaker depth | 8% |
+| filled | never seen: placed by the fill passes (Difix-repaired novel views) | 16% |
+| inferred | the infer pass (SEVA views of what the recording never saw) | 44% |
+| rebuilt | an object's unseen sides, grown by its rebuild (LTX orbit) | – |
+| completed | drawn by geometry-guided completion (below) | – |
+
+"Seen by a frame" is exact rather than a projection guess. It is the splat's blending weight summed over the frame's pixels: the gradient of the rendered frame with respect to the splat's colour. A first version depth-tested projected centres; it called the back layers of surfaces "never seen" even though they showed in recorded views. The whole scene takes 6 s on the 4090.
+
+The GPU worker renders the classes per pixel: class colour shaded by the splat's brightness, plus one channel per class, so every frame also reports how much of the screen each class covers. The viewer's **Show where each pixel came from (T)** shows this with a live legend.
+- **From the recording's own cameras:** 92–99% recorded, as it should be.
+- **Turned 150° away at the start of the walk:** 6% recorded, 8% recorded once, 26% filled, 60% inferred. That is exactly the view that looks blurry, and now the viewer says why.
+
+## Metric scale
+
+A camera solve has no scale. `metric_scale.py` compares MoGe-2's metric depth with the scene's rendered depth on 24 recorded frames (well-covered pixels, middle 60% of the frame). The per-frame median log ratio, taken as a median over frames, gives metres per unit. Courtyard: **1 unit = 7.78 m**, frame-to-frame spread ±17%.
+
+Check against objects of known kind (box height along up):
+- chairs 0.85–1.04 m;
+- bed 0.72 m;
+- tables 0.45–0.48 m.
+
+The ones out of range are fragments, such as a chair piece 9 cm tall. Written to `work/<name>/metric.json`.
+
+## Real to sim: MuJoCo and OpenUSD export
+
+`export_sim.py --scene courtyard-infer` writes `sim/<scene>/`: `scene.xml` (MJCF), `scene.usda` (UsdPhysics), `splats/` and `sim.json`.
+- **Frame:** metres, z up, z = 0 at the floor where the walk starts. The courtyard walk climbs about 3.8 m, so there is no single floor: every level comes from the static world, with a safety ground plane under the lowest.
+- **Static world:** every surface splat that isn't a movable object, near the walk. Splats are voxelised at 6 cm, holes are closed, and the voxels are merged into boxes. Courtyard: 30 × 19 × 9 m in 7,066 boxes.
+- **Bodies:** each movable object becomes a free rigid body.
+  - Its collision shape is its own splats voxelised (20 voxels along its longest side) and merged into boxes, so a chair keeps its legs and a table the space under it. A first version used convex hulls; a hull fills that space and swallows the chairs tucked under a table or the cushions on a sofa, which would explode on the first step.
+  - Splats that sit inside the static world (feet in the floor) are left out, so bodies don't start interpenetrating.
+- **Physical properties:** imajev's answers weighed against a prior for the kind (naive Bayes), with both recorded in `sim.json`.
+  - Movable: kind prior 80% × imajev 30% gives 63% for the sofa.
+  - Mass classes are combined the same way: sofa 25 kg, chair 6.6 kg, bed 57 kg, side table 6.3 kg, vase 0.7 kg, coffee maker 3.9 kg.
+  - Material sets friction and restitution: wood 0.5, fabric 0.8, glass 0.3...
+- **Each body's splats** are written in its own frame and in metres (`splats/<body>.ply`), so a splat renderer can draw the simulated scene.
+- **Courtyard:** 11 bodies (sofa, chair, bed, two tables, four potted plants, coffee maker, vase). 76 objects stay in the static world: built in (doors, windows, stairs, cabinets, planters, trees), fixed, fragments, or too big to be one movable thing.
+
+`sim_run.py` settles the bodies (or shoves one) in MuJoCo, reports whether they settle and stay in the world, and writes the motion as rigid transforms in the scene frame, for replaying on the real splats. It needs the `mujoco` package, which isn't installed yet, so the export hasn't been stepped in a simulator.
+
+## Editable world
+
+Pick an object in the viewer (Objects list or its tag) to get **Remove / Turn ⟲ ⟳ / Away / Toward / Left / Right / Reset** (Delete, `[` and `]` work too). The GPU worker applies the rigid transform (or hides the object) on its splats, and its box follows. Nothing is saved.
+
+Two limits show straight away:
+- Splats of an object that SAM's masks missed stay behind as a ghost (the sofa's armrest). Rebuilt objects (below) are complete, so they move cleanly.
+- What was behind an object was never recorded. Moving it uncovers a hole, or the infer pass's estimate, and the trust view says which.
