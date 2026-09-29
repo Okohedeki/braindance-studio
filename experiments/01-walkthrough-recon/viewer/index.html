@@ -160,6 +160,7 @@
     <label class="check"><input type="checkbox" id="pathToggle" checked> Show recording path (P)</label>
     <label class="check" id="boundsRow" title="Keep the camera inside the space the recording saw; an artificial wall marks the edge (B)"><input type="checkbox" id="boundsToggle" checked> Stay inside recorded space (B)</label>
     <label class="check" id="heightRow" title="Keep the camera near the recording's height, where the reconstruction renders well; off lets you rise to the ceiling (H)"><input type="checkbox" id="heightToggle" checked> Limit height to what renders well (H)</label>
+    <label class="check" id="inferredRow" hidden title="Tint violet the parts added for what the recording never saw: generated guesses, not reconstruction (I)"><input type="checkbox" id="inferredToggle"> Show what's inferred (I)</label>
     <p class="hint" id="modeHint">Drag to step out of the recording camera.</p>
     <div id="objectsSection">
       <h2>Objects</h2>
@@ -333,6 +334,14 @@ const freeSpace = meta.freeSpace ? await (async () => {
   } catch { return null; }
 })() : null;
 if (!freeSpace) { $("boundsRow").style.display = "none"; $("heightRow").style.display = "none"; }
+// Splats added for what the recording never saw (unseen_bake.py). The GPU
+// worker tints them violet on request; the browser renderer can't.
+let showInferred = false;
+$("inferredRow").hidden = !meta.inferred;
+$("inferredToggle").onchange = (e) => {
+  showInferred = e.target.checked;
+  if (showInferred && !gpuActive()) toast.textContent = "Showing what's inferred needs the GPU renderer.";
+};
 // Scene units are uncalibrated; movement speed and wall size follow the
 // scene's median surface distance.
 const unit = freeSpace?.medianDepth ?? 1;
@@ -623,7 +632,8 @@ function gpuRequest(w, h, background, quality = 90) {
   const fy = (h / 2) / Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2);
   return { type: "render", id: gpu.nextId++, scene: sceneName, c2w, fx: fy, fy, cx: w / 2, cy: h / 2,
     width: w, height: h, quality, background,
-    objects: objects.list.length ? { show: objects.show, focus: objects.focus || null } : undefined };
+    objects: objects.list.length ? { show: objects.show, focus: objects.focus || null } : undefined,
+    inferred: showInferred || undefined };
 }
 
 // GPU frames are rendered at the canvas's pixel size, capped at ~2.5 MP.
@@ -638,7 +648,7 @@ function requestGpuFrame() {
   const [w, h] = gpuSize();
   const req = gpuRequest(w, h, [BG.r, BG.g, BG.b]);
   const key = `${w}x${h}:${req.c2w.map((v) => v.toFixed(5)).join(",")}:${camera.fov.toFixed(3)}`
-    + `:${objects.version}:${objects.show}:${objects.focus}`;
+    + `:${objects.version}:${objects.show}:${objects.focus}:${showInferred}`;
   if (key === gpu.lastKey) return;
   gpu.lastKey = key;
   gpu.inFlight = req.id;
@@ -987,6 +997,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "b" && freeSpace) { $("boundsToggle").click(); }
   else if (k === "h" && freeSpace) { $("heightToggle").click(); }
   else if (k === "o" && objects.list.length) { $("objectsToggle").click(); }
+  else if (k === "i" && meta.inferred) { $("inferredToggle").click(); }
   else if (k === "Escape" && objects.focus) { focusObject(0); }
   else if (!locked && "wasdqe".includes(k)) keys.add(k);
   if (e.key === "Shift") keys.add("Shift");

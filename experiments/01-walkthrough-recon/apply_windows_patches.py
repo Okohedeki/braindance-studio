@@ -11,9 +11,14 @@
    but PyTorch's Windows wheels are built without FlashAttention, so video
    tracking stops with "No available kernel". Memory-efficient attention
    computes the same result and is allowed as a fallback.
+4. Stable Virtual Camera (SEVA) does the same in its transformer; same fix.
+5. SEVA loads its VAE from stabilityai/stable-diffusion-2-1-base, which is no
+   longer downloadable (HTTP 401). The sd2-community mirror hosts the same
+   files (identical checksums), so SEVA is pointed there. Not a Windows issue,
+   but a setup fix all the same.
 
 Safe to run more than once. Run it with the reconstruction environment for
-1 (it patches that environment's pycolmap); 2 and 3 patch files under tools/.
+1 (it patches that environment's pycolmap); the rest patch files under tools/.
 """
 
 import importlib.util
@@ -52,3 +57,13 @@ patch(REPO / "tools" / "sam3" / "sam3" / "model" / "decoder.py", [
     ("with sdpa_kernel(SDPBackend.FLASH_ATTENTION):",
      "with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):"),
 ])
+
+seva = REPO / "tools" / "stable-virtual-camera" / "seva" / "modules"
+if seva.exists():
+    patch(seva / "transformer.py", [
+        ("with sdpa_kernel(SDPBackend.FLASH_ATTENTION):",
+         "with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):"),
+    ])
+    patch(seva / "autoencoder.py", [
+        ('"stabilityai/stable-diffusion-2-1-base"', '"sd2-community/stable-diffusion-2-1-base"'),
+    ])

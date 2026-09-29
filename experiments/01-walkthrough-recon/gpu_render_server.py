@@ -15,7 +15,9 @@ Protocol
       cone the recording saw them from; needs observed.bin from observed_directions.py),
       "objects" (optional {"show": bool, "focus": object id or null}: tint the splats of
       objects placed by lift_objects.py in their colours; with a focus, that object is
-      tinted and everything else is dimmed and greyed)}
+      tinted and everything else is dimmed and greyed),
+      "inferred" (optional bool: tint violet the splats added for what the recording never
+      saw, flagged in inferred.bin by unseen_bake.py)}
   server -> client (binary): uint32 little-endian header length, JSON header
       {"type": "frame", "id", "renderMs", "encodeMs", "splats"}, then JPEG bytes
   server -> client (text) on failure: {"type": "error", "id", "message"}
@@ -47,6 +49,7 @@ VIEWER = Path(__file__).resolve().parent / "viewer"
 SCENE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_SIZE = 4096
 SH_C0 = 0.28209479177387814  # degree-0 spherical harmonic: colour = 0.5 + SH_C0 * dc
+INFERRED_TINT = (0.72, 0.45, 1.0)  # violet: guessed, not recorded
 
 
 def read_ply(path):
@@ -88,6 +91,7 @@ class Scene:
         self.dir = VIEWER / name
         self.objects = None  # (file mtime, per-splat ids, palette); loaded on first use
         self.tinted = (None, None)  # (key, colours)
+        self.inferred = None  # per-splat flags from inferred.bin; loaded on first use
         # Optional per-splat observation cones (observed_directions.py).
         self.observed = None
         if "observed" in meta and (VIEWER / name / meta["observed"]["file"]).is_file():
@@ -126,38 +130,51 @@ class Scene:
             self.objects = (mtime, torch.tensor(ids.astype(np.int64), device="cuda"), palette)
         return self.objects
 
-    def colors_for(self, objects):
-        """Splat colours with objects tinted (show) or one object picked out (focus)."""
-        if not objects or not (objects.get("show") or objects.get("focus")):
+    def load_inferred(self):
+        """Flags for splats added for what the recording never saw (unseen_bake.py), or None."""
+        if self.inferred is None:
+            path = self.dir / "inferred.bin"
+            flags = np.frombuffer(path.read_bytes(), np.uint8) if path.is_file() else np.zeros(0, np.uint8)
+            self.inferred = torch.tensor(flags.astype(bool), device="cuda") if len(flags) == self.count else False
+        return None if self.inferred is False else self.inferred
+
+    def colors_for(self, objects, inferred=False):
+        """Splat colours with objects tinted (show) or one object picked out (focus),
+        and inferred splats tinted violet."""
+        loaded = self.load_objects() if objects and (objects.get("show") or objects.get("focus")) else None
+        flags = self.load_inferred() if inferred else None
+        if loaded is None and flags is None:
             return self.colors
-        loaded = self.load_objects()
-        if loaded is None:
-            return self.colors
-        mtime, ids, palette = loaded
-        focus = int(objects.get("focus") or 0)
-        key = (mtime, bool(objects.get("show")), focus)
+        focus = int(objects.get("focus") or 0) if loaded else 0
+        key = (loaded[0] if loaded else None, bool(loaded and objects.get("show")), focus, flags is not None)
         if self.tinted[0] == key:
             return self.tinted[1]
         rgb = 0.5 + SH_C0 * self.colors[:, 0]
         keep = torch.ones(self.count, device="cuda")  # scale for the view-dependent terms
         out = rgb.clone()
-        if focus:
+        if loaded and focus:
+            _, ids, palette = loaded
             sel = ids == focus
             grey = (rgb * torch.tensor([0.299, 0.587, 0.114], device="cuda")).sum(1, keepdim=True)
             out = torch.where(sel[:, None], 0.6 * rgb + 0.4 * palette[focus], 0.4 * (0.3 * rgb + 0.7 * grey))
             keep = torch.where(sel, 0.6, 0.12)
-        else:
+        elif loaded:
+            _, ids, palette = loaded
             has = ids > 0
             out = torch.where(has[:, None], 0.55 * rgb + 0.45 * palette[ids], rgb)
             keep = torch.where(has, 0.55, 1.0)
+        if flags is not None:
+            tint = torch.tensor(INFERRED_TINT, device="cuda")
+            out = torch.where(flags[:, None], 0.5 * out + 0.5 * tint, out)
+            keep = torch.where(flags, keep * 0.5, keep)
         colors = torch.cat([((out - 0.5) / SH_C0)[:, None], self.colors[:, 1:] * keep[:, None, None]], 1)
         self.tinted = (key, colors)
         return colors
 
-    def render(self, c2w, K, w, h, fade=None, objects=None):
+    def render(self, c2w, K, w, h, fade=None, objects=None, inferred=False):
         """Image [H, W, 3] and alpha [H, W, 1] with the rasteriser the scene was trained with."""
         opacities = self.opacities_for(c2w[:3, 3], fade)
-        colors = self.colors_for(objects)
+        colors = self.colors_for(objects, inferred)
         viewmat = torch.linalg.inv(c2w)[None]
         with torch.no_grad():
             if self.primitive == "2dgs":
@@ -197,7 +214,7 @@ class Renderer:
         bg = torch.tensor(req.get("background", [0, 0, 0]), dtype=torch.float32, device="cuda")
         t0 = time.perf_counter()
         with torch.no_grad():
-            img, alpha = s.render(c2w, K, w, h, req.get("fade"), req.get("objects"))
+            img, alpha = s.render(c2w, K, w, h, req.get("fade"), req.get("objects"), bool(req.get("inferred")))
             # Composite over the background here (gsplat 1.5.3's backgrounds= argument
             # fails a shape check in packed mode).
             img = img + (1 - alpha) * bg
@@ -220,7 +237,7 @@ async def main():
     renderer = Renderer()
     pool = ThreadPoolExecutor(max_workers=1)  # one GPU, one queue
     hello = json.dumps({"type": "hello", "backend": f"gsplat {gsplat_version}",
-                        "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects"]})
+                        "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects", "inferred"]})
     loop = asyncio.get_running_loop()
 
     async def handler(ws):
