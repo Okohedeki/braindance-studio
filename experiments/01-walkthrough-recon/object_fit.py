@@ -199,9 +199,9 @@ def main():
             img, a_, _ = rasterization(s["means"][rest], s["quats"][rest], s["scales"][rest], s["opacities"][rest],
                                        s["colors"][rest], torch.linalg.inv(c2w)[None], Kr[None], rw, rh,
                                        sh_degree=3, rasterize_mode=mode, render_mode="RGB+ED")
-            d = torch.where(a_[0, ..., 0] > 0.5, img[0, ..., 3], torch.full_like(img[0, ..., 3], 1e9))
+            behind = torch.where(a_[0, ..., 0] > 0.5, img[0, ..., 3], torch.full_like(img[0, ..., 3], 1e9))
             outside = ~(F.max_pool2d(mask[None, None].float(), 7, stride=1, padding=3)[0, 0] > 0)
-            rest_depth.append((d, outside))
+            rest_depth.append((behind, outside))
     box_lo, box_hi = -half * 1.1, half * 1.1
     max_log_scale = math.log(0.25 * float(half.max()))
 
