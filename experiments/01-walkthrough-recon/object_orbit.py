@@ -88,7 +88,7 @@ def main():
     v = np.asarray(f0["c2w"])[:3, 3] - centre
     height = float(np.dot(v, up))
     horiz = v - height * up
-    radius = max(float(np.linalg.norm(horiz)), fit)
+    radius = fit  # the object alone: nothing to keep clear of, so frame it (a far camera left a vase a few pixels tall)
     elev = math.degrees(math.atan2(height, radius))
     elev = min(max(elev, 8.0), 35.0)
     height = radius * math.tan(math.radians(elev))
