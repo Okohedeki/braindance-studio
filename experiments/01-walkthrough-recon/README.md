@@ -434,10 +434,60 @@ The ones out of range are fragments, such as a chair piece 9 cm tall. Written to
 
 `sim_run.py` settles the bodies (or shoves one) in MuJoCo, reports whether they settle and stay in the world, and writes the motion as rigid transforms in the scene frame, for replaying on the real splats. It needs the `mujoco` package, which isn't installed yet, so the export hasn't been stepped in a simulator.
 
+## Rebuilding objects whole (the scroll-studio technique)
+
+The recording sees most objects from one side. `rebuild_objects.py --scene courtyard-infer --out courtyard-objects` rebuilds each free-standing object from every side, using the technique from scroll-studio (a video model guided by rendered depth):
+
+1. **Orbit** (`object_orbit.py`). The object's splats alone, less floaters away from its main body, along a 97-frame orbit that starts from the direction the recording saw it best and frames it at 55% of the height. Depth is encoded as scroll-studio's Blender pass does it (far-clamped log depth, near = white), and the first frame is the object on plain grey.
+2. **Generate** (`object_generate.py`). LTX-2.3 22B distilled (fp8) with the union-control IC-LoRA, in the local ComfyUI, guided by that depth (blurred, strength 0.6), with the first frame as the start. The prompt comes from the object's kind and imajev's material.
+3. **Fit** (`object_fit.py`).
+   - The object's reconstructed splats stay fixed except their opacity, and 40k seeds through its box learn the rest.
+   - The fit uses the recorded frames it appears in, masked by its SAM masks, plus the generated orbit, colour-matched to the recording and trusted only inside its projected box. Each orbit frame gets a small camera correction.
+   - The check: PSNR against the recording inside the object's real masks, reconstructed object alone vs rebuilt object alone.
+4. **Swap** (`object_replace.py`). The rebuilt objects replace their old splats in a new package; splats grown for unseen sides are flagged 2 ("rebuilt").
+
+**Which objects.** The largest free-standing objects (not built in, not plants) that imajev confirms are what their label says (at least 50%). imajev's "movable" is too cautious to choose by. On the courtyard, the confirmation gate left out "table 2", which imajev thinks is a bench (23%). Sofa 2 was left out by hand: its reconstruction is only the wooden frame.
+
+**Results** (`viewer/courtyard-objects`, about 280 s per object on the 4090):
+
+| Object | vs recording, reconstructed → rebuilt | Covers its real mask |
+|---|---|---|
+| sofa 1 | 19.6 → 31.2 dB | 92% → 100% |
+| table 1 (side table) | 20.2 → 30.0 dB | 89% → 100% |
+| vase 1 | 23.1 → 29.6 dB | 97% → 100% |
+| bed 1 | 20.8 → 29.4 dB | 87% → 99% |
+| chair 1 (two chairs) | 28.4 → 28.3 dB | 98% → 100% |
+| coffee maker 1 | 18.5 → 27.2 dB | 90% → 100% |
+
+The scene goes from 1.79M to 1.87M splats; 5% are now "rebuilt" in the trust map. The PSNR only checks that the rebuilt object still matches what was recorded (and fills its holes there). Nothing can score the sides nobody filmed, so `work/captures/courtyard_rebuild_isolated.jpg` shows each object alone from the front, side, back, other side and above, before and after:
+- **Sofa 1:** from the side, back and above the reconstruction is broken fragments. Rebuilt, it is a complete sofa from every side: arms, legs, back frame, cushions.
+- **Coffee maker:** side views go from smears to a solid body.
+- **Vase:** solid from every side, but the wrong shape: LTX gave it horns and handles it doesn't have.
+- **Chairs:** already well recorded; the rebuild is more complete but blobbier at the base.
+- **Side table:** still messy.
+
+Moving a rebuilt object in the viewer leaves no ghost behind, unlike the reconstructed sofa.
+
+**What went wrong on the way:**
+
+| Problem | Fix |
+|---|---|
+| "Studio turntable shot" in the prompt: LTX invented a turntable platform under the chair and the bed | Prompt asks for an orbit with the object resting on the floor; platforms, pedestals and turntables in the negative prompt; generated pixels only count inside the object's projected box |
+| A stray shard in the first frame became a floating stick in every generated frame | Drop splats away from the object's main body (voxel components) before the orbit |
+| The orbit kept the recording camera's distance: a vase was a few pixels tall | Frame the object, since it is rendered alone |
+| An old fit's folder was keyed by an object id that changed when objects were placed again | Rebuild folders are matched to objects by kind, orbit centre and size |
+
+**The limit:** a rebuild is only as good as the object it starts from.
+- "Bed 1" is only its striped cover plus part of a lamp, so LTX drew a crumpled cover, not a bed.
+- "Chair 1" is two chairs merged into one object.
+- Sofa 2's reconstruction is only its frame, and LTX grew it into a boat-like shape.
+
+Better segmentation (separate instances, whole objects) would help more than a better generator.
+
 ## Editable world
 
 Pick an object in the viewer (Objects list or its tag) to get **Remove / Turn ⟲ ⟳ / Away / Toward / Left / Right / Reset** (Delete, `[` and `]` work too). The GPU worker applies the rigid transform (or hides the object) on its splats, and its box follows. Nothing is saved.
 
 Two limits show straight away:
-- Splats of an object that SAM's masks missed stay behind as a ghost (the sofa's armrest). Rebuilt objects (below) are complete, so they move cleanly.
+- Splats of an object that SAM's masks missed stay behind as a ghost (the sofa's armrest). Rebuilt objects (above) are complete, so they move cleanly.
 - What was behind an object was never recorded. Moving it uncovers a hole, or the infer pass's estimate, and the trust view says which.
