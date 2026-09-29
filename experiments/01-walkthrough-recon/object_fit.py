@@ -181,18 +181,43 @@ def main():
     delta = torch.nn.Parameter(torch.zeros(len(views), 6, device="cuda"))
     dopt = torch.optim.Adam([delta], lr=1e-3)
 
-    def render(c2w, bg, Kr=K, w=W, h=H):
+    def render(c2w, bg, Kr=K, w=W, h=H, depth=False):
         img, alpha, _ = rasterization(
             full("means"), F.normalize(full("quats"), dim=1), torch.exp(full("scales")),
             torch.sigmoid(full("opacities")), torch.cat([full("sh0"), full("shN")], 1),
-            torch.linalg.inv(c2w)[None], Kr[None], w, h, sh_degree=3, rasterize_mode=mode)
-        return img[0] + (1 - alpha[0]) * bg, alpha[0, ..., 0]
+            torch.linalg.inv(c2w)[None], Kr[None], w, h, sh_degree=3, rasterize_mode=mode,
+            render_mode="RGB+ED" if depth else "RGB")
+        rgb = img[0, ..., :3] + (1 - alpha[0]) * bg
+        return (rgb, alpha[0, ..., 0], img[0, ..., 3]) if depth else (rgb, alpha[0, ..., 0])
+
+    # The rest of the scene's depth in each recorded frame: outside the object's mask, the object must not
+    # cover anything it would stand in front of (seeds hazing a recorded view the orbit never checks).
+    rest = torch.tensor(ids != args.object, device="cuda")
+    rest_depth = []
+    with torch.no_grad():
+        for c2w, gt, mask, Kr, rw, rh in recorded:
+            img, a_, _ = rasterization(s["means"][rest], s["quats"][rest], s["scales"][rest], s["opacities"][rest],
+                                       s["colors"][rest], torch.linalg.inv(c2w)[None], Kr[None], rw, rh,
+                                       sh_degree=3, rasterize_mode=mode, render_mode="RGB+ED")
+            d = torch.where(a_[0, ..., 0] > 0.5, img[0, ..., 3], torch.full_like(img[0, ..., 3], 1e9))
+            outside = ~(F.max_pool2d(mask[None, None].float(), 7, stride=1, padding=3)[0, 0] > 0)
+            rest_depth.append((d, outside))
+    box_lo, box_hi = -half * 1.1, half * 1.1
+    max_log_scale = math.log(0.25 * float(half.max()))
+
+    def keep_seeds_in_box():
+        """Seeds stay inside the object's box and no bigger than a quarter of it."""
+        with torch.no_grad():
+            local = (params["means"] - centre) @ axes.T
+            params["means"].copy_(centre + torch.maximum(torch.minimum(local, box_hi), box_lo) @ axes)
+            params["scales"].clamp_(max=max_log_scale)
 
     ssim_fn = __import__("fused_ssim").fused_ssim
     for step in range(args.steps):
         if recorded and torch.rand(1).item() < args.recorded_prob:
-            c2w, gt, mask, Kr, rw, rh = recorded[int(torch.randint(len(recorded), (1,)))]
-            pred, alpha = render(c2w, torch.zeros(3, device="cuda"), Kr, rw, rh)
+            j = int(torch.randint(len(recorded), (1,)))
+            c2w, gt, mask, Kr, rw, rh = recorded[j]
+            pred, alpha, depth = render(c2w, torch.zeros(3, device="cuda"), Kr, rw, rh, depth=True)
             # Only the object's own pixels: elsewhere other things stand in front of or behind it.
             m = mask[..., None].float()
             target = m * gt + (1 - m) * pred.detach()
@@ -200,10 +225,15 @@ def main():
             loss = (0.8 * (pred - target).abs().mean() + 0.2 * (1 - torch.nan_to_num(ssim_fn(
                 pred.permute(2, 0, 1)[None], target.permute(2, 0, 1)[None], padding="valid")))) / share * 0.05
             loss = loss + 0.1 * (1 - alpha[mask]).mean()
+            d_rest, outside = rest_depth[j]
+            front = outside & (depth < d_rest * 0.98)
+            if front.any():
+                loss = loss + 0.5 * alpha[front].mean()
             loss.backward()
             for o in opts.values():
                 o.step()
                 o.zero_grad(set_to_none=True)
+            keep_seeds_in_box()
             continue
         i = int(torch.randint(len(views), (1,)))
         c2w, gt, mask, bg = views[i]
@@ -220,6 +250,7 @@ def main():
         for o in opts.values():
             o.step()
             o.zero_grad(set_to_none=True)
+        keep_seeds_in_box()
         dopt.step()
         dopt.zero_grad(set_to_none=True)
         if step % 1000 == 0:
