@@ -49,6 +49,80 @@ def held_out_psnr(scene, work, scale=0.5):
     return round(float(np.mean(vals)), 2)
 
 
+def integrate(cols, trainable, opacity_only, work, mode, steps, scale=0.5):
+    """Fit the swapped-in objects into the scene on every recorded training frame (whole frames).
+
+    The per-object fit only saw each object alone; in the scene its grown splats can haze views the
+    object isn't in, and splats of the object that SAM's masks missed are still in the scene, doubling
+    it up. Here only the rebuilt objects' splats train, plus the opacity of other splats inside their
+    boxes (so leftover pieces can fade); everything else stays as it was."""
+    import random
+    import torch.nn.functional as F
+    from fused_ssim import fused_ssim
+    from gsplat.rendering import rasterization
+    from PIL import Image
+    sys.path.insert(0, str(HERE.parents[1] / "tools" / "gsplat-src" / "examples"))
+    from datasets.colmap import Parser
+    names = list(cols)
+    t = lambda a: torch.tensor(np.asarray(a, np.float32), device="cuda")
+    fr = sorted((k for k in names if k.startswith("f_rest_")), key=lambda k: int(k[7:]))
+    n = len(cols["x"])
+    p = {"means": t(np.stack([cols["x"], cols["y"], cols["z"]], 1)),
+         "quats": t(np.stack([cols[f"rot_{i}"] for i in range(4)], 1)),
+         "scales": t(np.stack([cols[f"scale_{i}"] for i in range(3)], 1)), "opacities": t(cols["opacity"]),
+         "sh0": t(np.stack([cols[f"f_dc_{i}"] for i in range(3)], 1)).reshape(n, 1, 3),
+         "shN": t(np.stack([cols[k] for k in fr], 1)).reshape(n, 3, -1).transpose(1, 2).contiguous()}
+    p = {k: torch.nn.Parameter(v) for k, v in p.items()}
+    train_all = torch.tensor(trainable, device="cuda")
+    train_opacity = train_all | torch.tensor(opacity_only, device="cuda")
+    parser = Parser(data_dir=str(work / "train"), factor=1, normalize=True, test_every=8)
+    idx = np.arange(len(parser.image_names))
+    frames = []
+    for i in idx[idx % 8 != 0]:
+        Wf, Hf = parser.imsize_dict[parser.camera_ids[i]]
+        w, h = int(Wf * scale) // 8 * 8, int(Hf * scale) // 8 * 8
+        K = torch.tensor(parser.Ks_dict[parser.camera_ids[i]], dtype=torch.float32, device="cuda").clone()
+        K[0] *= w / Wf
+        K[1] *= h / Hf
+        img = np.asarray(Image.open(parser.image_paths[i]).convert("RGB").resize((w, h), Image.BICUBIC)).copy()
+        frames.append((torch.tensor(parser.camtoworlds[i], dtype=torch.float32, device="cuda"), K, w, h,
+                       torch.from_numpy(img).pin_memory()))
+    scene_scale = parser.scene_scale * 1.1
+    lrs = {"means": 1.6e-5 * scene_scale, "scales": 2.5e-3, "quats": 5e-4, "opacities": 2.5e-2,
+           "sh0": 1.25e-3, "shN": 1.25e-3 / 20}
+    opts = {k: torch.optim.Adam([p[k]], lr=lrs[k], eps=1e-15) for k in p}
+    random.seed(0)
+    for step in range(steps):
+        c2w, K, w, h, gt = random.choice(frames)
+        img, _, _ = rasterization(p["means"], F.normalize(p["quats"], dim=1), torch.exp(p["scales"]),
+                                  torch.sigmoid(p["opacities"]), torch.cat([p["sh0"], p["shN"]], 1),
+                                  torch.linalg.inv(c2w)[None], K[None], w, h, sh_degree=3, rasterize_mode=mode)
+        pred, gt = img[0].clamp(0, 1), gt.to("cuda", non_blocking=True).float() / 255
+        loss = 0.8 * (pred - gt).abs().mean() + 0.2 * (1 - fused_ssim(pred.permute(2, 0, 1)[None],
+                                                                     gt.permute(2, 0, 1)[None], padding="valid"))
+        loss.backward()
+        for k, v in p.items():
+            if v.grad is not None:
+                v.grad[~(train_opacity if k == "opacities" else train_all)] = 0
+        for o in opts.values():
+            o.step()
+            o.zero_grad(set_to_none=True)
+    out = {k: v.detach() for k, v in p.items()}
+    cols = dict(cols)
+    cols.update(x=out["means"][:, 0], y=out["means"][:, 1], z=out["means"][:, 2], opacity=out["opacities"])
+    for i in range(3):
+        cols[f"f_dc_{i}"] = out["sh0"][:, 0, i]
+        cols[f"scale_{i}"] = out["scales"][:, i]
+    for i in range(4):
+        cols[f"rot_{i}"] = out["quats"][:, i]
+    shn = out["shN"].transpose(1, 2).reshape(n, -1)
+    for j, k in enumerate(fr):
+        cols[k] = shn[:, j]
+    del p, opts
+    torch.cuda.empty_cache()
+    return {k: (v.cpu().numpy() if torch.is_tensor(v) else v) for k, v in cols.items()}
+
+
 def write_ply(path, cols):
     names = list(cols)
     n = len(cols[names[0]])
@@ -66,6 +140,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--work", help="work folder (default: scene name up to its first '-')")
     ap.add_argument("--objects", type=int, nargs="*", help="only these object ids (default: every finished rebuild)")
+    ap.add_argument("--integrate", type=int, default=3000,
+                    help="steps fitting the swapped-in objects into the scene on whole recorded frames (0 = none)")
     args = ap.parse_args()
 
     src = HERE / "viewer" / args.scene
@@ -119,6 +195,22 @@ def main():
         new_flags.append(np.where(gen, 2, 0).astype(np.uint8))
         rebuilt[oid] = {"splats": m, "grown": int(gen.sum()), "fit": fit}
     cols = {k: np.concatenate([ply[k][keep]] + new_cols[k]) for k in names}
+    n_keep = int(keep.sum())
+    if args.integrate and rebuilt and (work / "train").exists():
+        trainable = np.r_[np.zeros(n_keep, bool), np.ones(len(cols["x"]) - n_keep, bool)]
+        # other splats inside a rebuilt object's box: pieces of it the masks missed, allowed to fade
+        pts = np.stack([ply["x"][keep], ply["y"][keep], ply["z"][keep]], 1)
+        inside = np.zeros(n_keep, bool)
+        for oid in rebuilt:
+            b = by_id[oid]["box"]
+            local = (pts - np.asarray(b["center"])) @ np.asarray(b["axes"]).T
+            inside |= (np.abs(local) <= np.asarray(b["half"])).all(1)
+        meta0 = json.loads((src / "scene.json").read_text())
+        mode = "antialiased" if meta0.get("rasterization") == "antialiased" else "classic"
+        cols = integrate(cols, trainable, np.r_[inside, np.zeros(len(cols["x"]) - n_keep, bool)], work, mode,
+                         args.integrate)
+        print(f"integrated into the scene on recorded frames ({args.integrate} steps; {int(inside.sum())} other "
+              f"splats inside the rebuilt boxes could fade)", flush=True)
     write_ply(out / "scene.ply", cols)
     ids_out = np.concatenate([ids[keep]] + new_ids)
     flags_out = np.concatenate([inferred[keep]] + new_flags)
