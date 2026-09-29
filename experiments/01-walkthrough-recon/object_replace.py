@@ -1,0 +1,116 @@
+"""Swap rebuilt objects (object_fit.py) into a scene, as a new viewer package.
+
+For every object with an object.pt in work/<work>/objects/rebuild/<id>/, its
+old splats leave the scene and the rebuilt ones take their place. objects.bin
+keeps pointing at the object; inferred.bin marks the splats the rebuild grew
+for what the recording never saw with 2 ("rebuilt"; 1 stays "inferred" by the
+infer pass), and the rebuilt object's own reconstructed splats with 0.
+
+  python object_replace.py --scene courtyard-infer --out courtyard-objects
+
+Run with the reconstruction environment.
+"""
+
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from gpu_render_server import read_ply  # noqa: E402
+
+
+def write_ply(path, cols):
+    names = list(cols)
+    n = len(cols[names[0]])
+    header = "ply\nformat binary_little_endian 1.0\n" + f"element vertex {n}\n" + \
+             "".join(f"property float {k}\n" for k in names) + "end_header\n"
+    data = np.stack([np.asarray(cols[k], np.float32) for k in names], 1)
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(data.astype("<f4").tobytes())
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--scene", required=True, help="viewer package the objects were rebuilt from")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--work", help="work folder (default: scene name up to its first '-')")
+    args = ap.parse_args()
+
+    src = HERE / "viewer" / args.scene
+    work = HERE / "work" / (args.work or args.scene.split("-")[0])
+    out = HERE / "viewer" / args.out
+    if out.exists():
+        shutil.rmtree(out)
+    shutil.copytree(src, out, ignore=shutil.ignore_patterns("scene.ply", "objects.bin", "inferred.bin", "coverage.splat"))
+
+    ply = read_ply(src / "scene.ply")
+    names = list(ply)
+    n = len(ply["x"])
+    ids = np.frombuffer((src / "objects.bin").read_bytes(), dtype="<u2").copy()
+    inferred = (np.frombuffer((src / "inferred.bin").read_bytes(), np.uint8).copy() if (src / "inferred.bin").exists()
+                else np.zeros(n, np.uint8))
+    listing = json.loads((src / "objects.json").read_text())
+    keep = np.ones(n, bool)
+    new_cols = {k: [] for k in names}
+    new_ids, new_flags, rebuilt = [], [], {}
+    for pt in sorted((work / "objects" / "rebuild").glob("*/object.pt")):
+        oid = int(pt.parent.name)
+        fit = json.loads((pt.parent / "fit.json").read_text())
+        data = torch.load(pt, map_location="cpu", weights_only=False)
+        sp, gen = data["splats"], data["generated"].numpy()
+        keep &= ids != oid
+        m = len(sp["means"])
+        rest = sp["shN"].permute(0, 2, 1).reshape(m, -1).numpy()  # gsplat's ply: f_rest channel-major
+        q = torch.nn.functional.normalize(sp["quats"], dim=1).numpy()
+        vals = {"x": sp["means"][:, 0], "y": sp["means"][:, 1], "z": sp["means"][:, 2],
+                "opacity": sp["opacities"]}
+        for k in names:
+            if k in vals:
+                new_cols[k].append(np.asarray(vals[k]))
+            elif k.startswith("f_dc_"):
+                new_cols[k].append(sp["sh0"][:, 0, int(k[5:])].numpy())
+            elif k.startswith("f_rest_"):
+                new_cols[k].append(rest[:, int(k[7:])])
+            elif k.startswith("scale_"):
+                new_cols[k].append(sp["scales"][:, int(k[6:])].numpy())
+            elif k.startswith("rot_"):
+                new_cols[k].append(q[:, int(k[4:])])
+            else:
+                new_cols[k].append(np.zeros(m, np.float32))
+        new_ids.append(np.full(m, oid, np.uint16))
+        new_flags.append(np.where(gen, 2, 0).astype(np.uint8))
+        rebuilt[oid] = {"splats": m, "grown": int(gen.sum()), "fit": fit}
+    cols = {k: np.concatenate([ply[k][keep]] + new_cols[k]) for k in names}
+    write_ply(out / "scene.ply", cols)
+    ids_out = np.concatenate([ids[keep]] + new_ids)
+    flags_out = np.concatenate([inferred[keep]] + new_flags)
+    (out / "objects.bin").write_bytes(ids_out.astype("<u2").tobytes())
+    (out / "inferred.bin").write_bytes(flags_out.tobytes())
+
+    for o in listing["objects"]:
+        if o["id"] in rebuilt:
+            o["rebuilt"] = rebuilt[o["id"]]
+            o["splats"] = rebuilt[o["id"]]["splats"]
+    (out / "objects.json").write_text(json.dumps(listing, indent=1))
+    meta = json.loads((src / "scene.json").read_text())
+    meta["splatCount"] = int(len(ids_out))
+    meta.pop("coverage", None)
+    meta["inferred"] = {**meta.get("inferred", {}), "file": "inferred.bin", "count": int((flags_out > 0).sum()),
+                        "values": {"1": "estimated for what the recording never saw (infer pass)",
+                                   "2": "grown by an object rebuild for sides of it the recording never saw"}}
+    meta["provenance"]["rebuilt"] = (f"{len(rebuilt)} objects rebuilt whole (rebuild_objects.py): LTX-2.3 generated an "
+                                     "orbit guided by each object's own depth, fitted together with the recorded frames "
+                                     "it appears in; flagged 2 in inferred.bin where the rebuild grew what wasn't seen")
+    (out / "scene.json").write_text(json.dumps(meta, indent=1))
+    print(f"{len(rebuilt)} objects swapped in: {n} -> {len(ids_out)} splats -> {out}")
+
+
+if __name__ == "__main__":
+    main()

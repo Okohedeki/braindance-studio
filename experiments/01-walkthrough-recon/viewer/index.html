@@ -761,6 +761,35 @@ function buildObjectViews() {
   }
 }
 
+// What imajev answered about an object (identify_objects.py), shortest first.
+function describeObject(o) {
+  const a = o.attributes;
+  if (!a || a.skipped) return "";
+  const parts = [];
+  if (a.material?.value) parts.push(a.material.value);
+  if (a.mass?.value) parts.push(a.mass.value);
+  if (a.movable) parts.push(a.movable.p >= 0.5 ? "movable" : "fixed");
+  if (o.rebuilt) parts.push("rebuilt whole");
+  return parts.join(" · ");
+}
+function describeObjectLong(o) {
+  const a = o.attributes;
+  const lines = [o.name];
+  if (a && !a.skipped) {
+    const pct = (p) => `${Math.round(100 * p)}%`;
+    lines.push(`is a ${o.label}: ${pct(a.isLabel.p)}`);
+    if (a.material) lines.push(`material: ${a.material.value} (${pct(a.material.probabilities[a.material.value])})`);
+    if (a.mass) lines.push(`mass: ${a.mass.value} (${pct(a.mass.probabilities[a.mass.value])})`);
+    lines.push(`movable: ${pct(a.movable.p)} · rigid: ${pct(a.rigid.p)} · whole in view: ${pct(a.wholeInView.p)}`);
+    lines.push(`classifier: ${a.classifier}`);
+  }
+  if (o.rebuilt) {
+    const v = o.rebuilt.fit.vsRecording;
+    lines.push(`rebuilt whole: ${v.reconstructed.psnrInRealMask} -> ${v.rebuilt.psnrInRealMask} dB vs the recording`);
+  }
+  return lines.join("\n");
+}
+
 function fmtShort(sec) {
   return `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
 }
@@ -782,7 +811,7 @@ function renderObjectList() {
       const li = document.createElement("li");
       const b = document.createElement("button");
       b.dataset.id = o.id;
-      b.title = `Pick out ${o.name} and jump to the recorded frame that shows it best`;
+      b.title = describeObjectLong(o) + "\n\nClick to pick it out and jump to the recorded frame that shows it best";
       const swatch = document.createElement("i");
       swatch.style.background = `rgb(${o.color.join(",")})`;
       const name = document.createElement("span");
@@ -804,6 +833,9 @@ function updateObjectViews() {
     o.view.on = objects.focus ? focused : objects.show;
     o.view.box.material.opacity = focused ? 1 : 0.6;
     o.view.tag.classList.toggle("focus", focused);
+    const extra = focused ? describeObject(o) : "";
+    o.view.tag.textContent = extra ? `${o.name} · ${extra}` : o.name;
+    o.view.tag.title = describeObjectLong(o);
   }
   for (const b of $("objectList").querySelectorAll("button[data-id]")) {
     b.setAttribute("aria-pressed", String(Number(b.dataset.id) === objects.focus));

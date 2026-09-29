@@ -7,11 +7,14 @@
   2. verify    imajev-4b (an open Jev-style decision model on the same base)
                checks every name against every keyframe with calibrated
                probabilities; names it doesn't confirm (>= --verify) are dropped
-  3. track     scan_objects.py: SAM 3.1 follows each confirmed kind through the
+               Variants are then grouped under a general name ("olive tree",
+               "palm tree" -> "tree") and surfaces/structure dropped
+  3. track     scan_objects.py: SAM 3.1 follows each general kind through the
                clips, and the tracks are placed in 3D as objects
   4. classify  imajev answers typed questions about each object on a crop of
-               the recorded frame that shows it best: is it really that kind,
-               material, movable, rigid, mass, whole object in view. Answers go
+               the recorded frame that shows it best: which variant it is, is it
+               really that kind, material, movable, rigid, mass, whole object in
+               view. Answers go
                into objects.json as "attributes", each with its probabilities
                and imajev's "can't tell" share
 
@@ -47,6 +50,43 @@ MATERIALS = {"wood": "wood or wood veneer", "metal": "metal", "glass": "glass or
 MASS = {"under 1 kg": "light enough to lift with one hand", "1-10 kg": "liftable by one person",
         "10-50 kg": "heavy; one or two people to move", "over 50 kg": "very heavy or built in"}
 
+# Consolidation before tracking: SAM 3.1 finds "tree" whether it's an olive or a palm, so tracking every
+# variant costs time and makes duplicates. Variants are tracked under one general name; imajev then says
+# which variant each object is. Surfaces and building structure aren't objects to pick out.
+STRUCTURE_HEADS = {"floor", "flooring", "ceiling", "deck", "decking", "pathway", "path", "pavement", "paving",
+                   "panel", "paneling", "panelling", "overhang", "beam", "doorway", "doorframe", "building", "roof",
+                   "tile", "tiling", "grass", "lawn", "ground", "siding", "cladding", "facade", "walkway", "driveway"}
+STRUCTURE_NAMES = {"door frame", "window frame", "paving stone", "stone paving", "wall", "exterior wall"}
+SYNONYMS = {"stair": "stairs", "step": "stairs", "staircase": "stairs", "stairway": "stairs",
+            "wall art": "artwork", "painting": "artwork", "picture": "artwork", "framed picture": "artwork",
+            "pillow": "cushion", "throw pillow": "cushion", "bush": "shrub", "hedge": "shrub",
+            "lamp post": "street light", "lamppost": "street light", "switch": "light switch",
+            "plant bed": "planter", "flower bed": "planter", "planter box": "planter", "couch": "sofa",
+            "tv": "television", "armchair": "chair", "stool": "chair", "ceiling light": "light fixture",
+            "led strip light": "light fixture", "wall sconce": "light fixture", "sconce": "light fixture",
+            "drape": "curtain", "curtains": "curtain", "blinds": "curtain", "desk": "table",
+            "nightstand": "side table", "bedside table": "side table", "end table": "side table"}
+
+
+def consolidate(names):
+    """{general name: [variants]} for the confirmed names, and the names dropped as structure."""
+    dropped = sorted(n for n in names if n in STRUCTURE_NAMES or n.split()[-1] in STRUCTURE_HEADS)
+    general = {n: SYNONYMS.get(n, n) for n in names if n not in dropped}
+    # a qualified name joins the plainer kind it ends with ("olive tree" -> "tree", "coffee table" -> "table")
+    for _ in range(3):
+        kinds = set(general.values())
+        for n, g in general.items():
+            words = g.split()
+            for k in range(1, len(words)):
+                tail = " ".join(words[k:])
+                if tail in kinds:
+                    general[n] = tail
+                    break
+    groups = {}
+    for n, g in general.items():
+        groups.setdefault(g, []).append(n)
+    return {g: sorted(set(v) | {g}) for g, v in groups.items()}, dropped
+
 
 def venv_python(name):
     return REPO / name / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -65,7 +105,7 @@ class Imajev:
     def __init__(self, port, log_path):
         self.url = f"http://127.0.0.1:{port}"
         self.log = open(log_path, "a", encoding="utf-8")
-        cmd = [str(venv_python(".venv-seva")), "scripts/playground/server.py", "--backend", "torch", "--fast",
+        cmd = [str(venv_python(".venv-seva")), str(HERE / "imajev_serve.py"), "--backend", "torch", "--fast",
                "--model-bundle", "artifacts/model-qwen4b.json", "--adapter", "adapters/imajev-4b",
                "--calibration", "adapters/imajev-4b/calibration.json", "--model-name", "imajev-4b",
                "--port", str(port)]
@@ -183,14 +223,18 @@ def main():
             timed("verify", verify)
         verified = json.loads((out / "verified.json").read_text())["kept"]
         print(f"{len(verified)} kinds confirmed: {', '.join(verified)}", flush=True)
-        report["kinds"] = verified
+        groups, dropped = consolidate(verified)
+        (out / "consolidated.json").write_text(json.dumps({"kinds": groups, "droppedAsStructure": dropped}, indent=1))
+        print(f"{len(groups)} kinds to track: {', '.join(groups)}; dropped as structure: {', '.join(dropped)}", flush=True)
+        report["kinds"] = groups
+        report["droppedAsStructure"] = dropped
 
         # 3. track and place (SAM 3.1 needs the GPU memory imajev holds)
         if server:
             server.close()
             server = None
         timed("track", lambda: subprocess.run([sys.executable, str(HERE / "scan_objects.py"), "--scene", args.scene,
-                                               "--work", work_name, "--prompts", *verified],
+                                               "--work", work_name, "--prompts", *groups],
                                               cwd=HERE, env=clean_env(), check=True))
 
         # 4. classify each object
@@ -206,7 +250,12 @@ def main():
                     o["attributes"] = {"classifier": "imajev-4b", "skipped": "not in the mask of its best frame"}
                     continue
                 label = o["label"]
+                variants = sorted({v for lab in o.get("labels", [label]) for v in groups.get(lab, [lab])})
+                kind = {"kind": {"type": "choice", "instructions": "Which of these best describes the main object "
+                                                                   "in this photo?",
+                                 "criteria": {v: f"a {v}" for v in variants}}} if len(variants) > 1 else {}
                 a = server.ask(crop, {
+                    **kind,
                     "is_label": {"type": "noul", "instructions": f"The main object in this photo is a {label}."},
                     "material": {"type": "choice", "instructions": "What is the main object in this photo mostly made of?",
                                  "criteria": MATERIALS},
@@ -223,6 +272,8 @@ def main():
                 o["attributes"] = {"classifier": "imajev-4b", "isLabel": yes(a["is_label"]), "material": pick(a["material"]),
                                    "movable": yes(a["movable"]), "rigid": yes(a["rigid"]), "mass": pick(a["mass"]),
                                    "wholeInView": yes(a["whole"])}
+                if kind:
+                    o["attributes"]["kind"] = pick(a["kind"])
             listing["attributes"] = ("typed questions answered by imajev-4b on a crop of each object's best recorded "
                                      "frame; probabilities calibrated, cantTell = imajev's share for \"can't tell\"")
             path.write_text(json.dumps(listing, indent=1))

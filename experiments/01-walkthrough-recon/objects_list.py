@@ -20,8 +20,12 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import torch
-from PIL import Image
+# The system Python's mistral_common (1.9.1) is older than transformers 5.13 expects, and transformers
+# imports its Mistral tokenizer whenever the package is installed. Qwen doesn't use it: report it absent.
+sys.modules.setdefault("mistral_common", None)
+
+import torch  # noqa: E402
+from PIL import Image  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
