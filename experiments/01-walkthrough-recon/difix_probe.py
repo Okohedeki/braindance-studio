@@ -48,7 +48,7 @@ def main():
             continue
         fy = f["fy"] * H / f["height"]
         K = torch.tensor([[fy, 0, W / 2], [0, fy, H / 2], [0, 0, 1]], dtype=torch.float32, device="cuda")
-        img, _ = scene.render(torch.tensor(c2w, dtype=torch.float32, device="cuda"), K, W, H)
+        img, *_ = scene.render(torch.tensor(c2w, dtype=torch.float32, device="cuda"), K, W, H)
         render = Image.fromarray((img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
         ref = Image.open(images / f["name"]).convert("RGB").resize((W, H))
         with torch.no_grad():

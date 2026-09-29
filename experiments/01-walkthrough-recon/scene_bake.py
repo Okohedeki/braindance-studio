@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--novel-weight", type=float, default=0.7)
     ap.add_argument("--scale", type=float, default=0.5, help="training resolution of the recorded frames")
     ap.add_argument("--changed", type=float, default=0.04, help="flag splats whose colour moved more than this")
+    ap.add_argument("--skip-paths", nargs="*", default=[], help="generated paths to leave out (e.g. p03 p04)")
     args = ap.parse_args()
     torch.manual_seed(0)
     random.seed(0)
@@ -117,7 +118,7 @@ def main():
     # generated paths
     novel, paths = [], []
     for d in sorted((work / "complete").glob("p[0-9][0-9]")):
-        if not (d / "gen").exists():
+        if not (d / "gen").exists() or d.name in args.skip_paths:
             continue
         cams = json.loads((d / "cameras.json").read_text())
         K = torch.tensor(cams["K"], dtype=torch.float32, device="cuda")

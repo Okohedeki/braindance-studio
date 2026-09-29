@@ -79,7 +79,7 @@ def probes(meta, pkg, count=6, rises=(0.45, 0.85)):
 def render(scene, c2w, f, w, h, fade=None):
     fy = f["fy"] * h / f["height"]
     K = torch.tensor([[fy, 0, w / 2], [0, fy, h / 2], [0, 0, 1]], dtype=torch.float32, device="cuda")
-    img, _ = scene.render(torch.tensor(c2w, dtype=torch.float32, device="cuda"), K, w, h, fade)
+    img, *_ = scene.render(torch.tensor(c2w, dtype=torch.float32, device="cuda"), K, w, h, fade)
     return (img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
 
 

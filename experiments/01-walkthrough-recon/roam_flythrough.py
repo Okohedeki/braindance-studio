@@ -167,7 +167,7 @@ def main():
         c2w = torch.tensor(look(c, d, up), dtype=torch.float32, device="cuda")
         tiles = []
         for scene, label in zip(scenes, labels):
-            img, _ = scene.render(c2w, K, w, h)
+            img, *_ = scene.render(c2w, K, w, h)
             tile = Image.fromarray((img.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8))
             ImageDraw.Draw(tile).text((8, 6), label, fill=(255, 255, 255))
             tiles.append(np.asarray(tile))
