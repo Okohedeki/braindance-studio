@@ -23,6 +23,7 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from gpu_render_server import read_ply  # noqa: E402
+from rebuild_objects import rebuild_matches  # noqa: E402
 
 
 def write_ply(path, cols):
@@ -60,8 +61,12 @@ def main():
     keep = np.ones(n, bool)
     new_cols = {k: [] for k in names}
     new_ids, new_flags, rebuilt = [], [], {}
-    for pt in sorted((work / "objects" / "rebuild").glob("*/object.pt")):
+    by_id = {o["id"]: o for o in listing["objects"]}
+    for pt in sorted((work / "objects" / "rebuild").glob("[0-9]*/object.pt")):
         oid = int(pt.parent.name)
+        if oid not in by_id or not rebuild_matches(pt.parent, by_id[oid]):
+            print(f"skipped {pt.parent}: made for another object (run rebuild_objects.py to sort the folders)")
+            continue
         fit = json.loads((pt.parent / "fit.json").read_text())
         data = torch.load(pt, map_location="cpu", weights_only=False)
         sp, gen = data["splats"], data["generated"].numpy()

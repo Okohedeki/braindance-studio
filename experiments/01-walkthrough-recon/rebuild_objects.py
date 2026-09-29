@@ -2,8 +2,9 @@
 
   python rebuild_objects.py --scene courtyard-infer --out courtyard-objects
 
-For each chosen object (default: every object of at least --min-splats,
-except plants, largest first):
+For each chosen object (default: the largest --limit free-standing objects
+of at least --min-splats: movable by imajev's answer, not built in, not
+plants):
   1. orbit     object_orbit.py: the object alone along an orbit, depth + first frame
   2. generate  object_generate.py: LTX-2.3 in the local ComfyUI, guided by that
                depth (the scroll-studio technique), shows it from every side
@@ -13,7 +14,7 @@ Then object_replace.py swaps the rebuilt objects into viewer/<out>.
 
 ComfyUI must be running (it holds the GPU while LTX runs; its models are
 unloaded before each fit). Each object's steps are skipped when done.
-Standard library only.
+Needs numpy; run with the reconstruction environment.
 """
 
 import argparse
@@ -28,6 +29,21 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import comfy_client  # noqa: E402
+import numpy as np  # noqa: E402
+
+# part of the building rather than a thing standing in it: not orbited on their own
+BUILT_IN = {"door", "window", "stairs", "curtain", "rug", "countertop", "cabinet", "tree", "planter", "shrub",
+            "artwork", "mirror", "light fixture", "light switch", "power outlet", "air conditioner", "street light",
+            "bed runner"}
+
+
+def rebuild_matches(d, o):
+    """Whether rebuild folder d was made for object o: same kind, orbit centred on its box. (Object
+    ids change whenever the objects are placed again, so the folder name alone doesn't say.)"""
+    cams = json.loads((d / "cameras.json").read_text())
+    centre = np.mean([np.asarray(c)[:3, 3] + cams["radius"] * np.asarray(c)[:3, 2] for c in cams["c2w"]], 0)  # looked at
+    return cams["label"] == o["label"] and \
+        np.linalg.norm(centre - np.asarray(o["box"]["center"])) < 0.5 * max(o["box"]["half"])
 
 
 def venv_python(name):
@@ -55,9 +71,16 @@ def main():
     work_name = args.work or args.scene.split("-")[0]
     rebuild = HERE / "work" / work_name / "objects" / "rebuild"
     listing = json.loads((HERE / "viewer" / args.scene / "objects.json").read_text())["objects"]
-    chosen = [o for o in listing if (o["id"] in args.objects) if args.objects] if args.objects else sorted(
-        [o for o in listing if o["splats"] >= args.min_splats and o["label"] not in args.skip],
-        key=lambda o: -o["splats"])[:args.limit]
+    def free_standing(o):
+        """imajev says a person could move it (identify_objects.py); without its answers, the kind decides."""
+        a = o.get("attributes") or {}
+        return a["movable"]["p"] >= 0.5 if "movable" in a else o["label"] not in BUILT_IN
+
+    if args.objects:
+        chosen = [o for o in listing if o["id"] in args.objects]
+    else:
+        chosen = sorted([o for o in listing if o["splats"] >= args.min_splats and o["label"] not in args.skip
+                         and o["label"] not in BUILT_IN and free_standing(o)], key=lambda o: -o["splats"])[:args.limit]
     recon = venv_python(".venv-recon")
     log = rebuild / "rebuild.log"
     rebuild.mkdir(parents=True, exist_ok=True)
@@ -69,6 +92,29 @@ def main():
             r = subprocess.run([str(c) for c in cmd], cwd=HERE, env=clean_env(), stdout=f, stderr=subprocess.STDOUT)
         if r.returncode:
             raise SystemExit(f"{cmd[1]} failed; see {log}")
+
+    # Object ids change whenever the objects are placed again: give each finished rebuild the id of the
+    # object it was made for, and set aside folders that match no object.
+    folders = [d for d in rebuild.glob("[0-9]*") if (d / "cameras.json").exists()]
+    renames = {}
+    for d in folders:
+        match = next((o for o in listing if rebuild_matches(d, o)), None)
+        if match is None or match["id"] != int(d.name):
+            renames[d] = match
+    for d, o in renames.items():
+        tmp = d.with_name(f"moving-{d.name}")
+        d.rename(tmp)
+        renames[d] = (tmp, o)
+    for d, (tmp, o) in renames.items():
+        target = rebuild / str(o["id"]) if o else rebuild / f"stale-{d.name}-{int(time.time())}"
+        if target.exists():
+            target = rebuild / f"stale-{d.name}-{int(time.time())}"
+        tmp.rename(target)
+        if o:
+            cams = json.loads((target / "cameras.json").read_text())
+            cams.update(object=o["id"], name=o["name"])
+            (target / "cameras.json").write_text(json.dumps(cams, indent=1))
+        print(f"rebuild folder {d.name} -> {target.name}" + (f" ({o['name']})" if o else " (matches no object)"), flush=True)
 
     if not comfy_client.ready():
         raise SystemExit("start ComfyUI first (see scroll-studio's README)")
