@@ -14,11 +14,14 @@ in turn:
      scene is fitted to it and to the paths before it, recorded splats frozen
      (scene_bake.py --lift)
 Then geometry_refine.py (MoGe-2 depth and normals, colour polish) and the
-trust map. The paths must already be planned (scene_paths.py --mode walk).
+trust map. Lifted splats that a recorded frame saw through are dropped
+(scene_bake.py), and the run stops if held-out recorded views fall, since
+each path is guided by the scene the one before it left. The paths must already be planned (scene_paths.py --mode walk).
 Standard library only; ComfyUI must be running.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -39,6 +42,8 @@ def main():
     ap.add_argument("--work", help="work folder (default: scene name up to its first '-')")
     ap.add_argument("--steps", type=int, default=4000, help="fitting steps per path")
     ap.add_argument("--views", default="run_courtyard-roam", help="repaired roam views for geometry_refine")
+    ap.add_argument("--max-drop", type=float, default=0.5,
+                    help="stop if held-out recorded views fall more than this (dB) below the first path's fit")
     args = ap.parse_args()
 
     work_name = args.work or args.scene.split("-")[0]
@@ -48,7 +53,7 @@ def main():
     env.update(PYTHONWARNINGS="ignore", PYTHONUNBUFFERED="1", HF_HOME=str(REPO / "tools" / "hf"))
     run = lambda *cmd: subprocess.run([str(c) for c in cmd], cwd=HERE, env=env, check=True)
 
-    current, done = args.scene, []
+    current, done, first = args.scene, [], None
     for i, path in enumerate(args.paths):
         print(f"== {path} ({i + 1}/{len(args.paths)}) from {current}", flush=True)
         if not (HERE / "viewer" / current / "trust.bin").exists():
@@ -61,6 +66,10 @@ def main():
         run(recon, HERE / "scene_bake.py", "--scene", current, "--out", step, "--work", work_name,
             "--paths", *args.base_paths, *done, "--lift", path, "--steps", args.steps)
         run(recon, HERE / "trust_map.py", "--scene", step)
+        held = json.loads((HERE / "viewer" / step / "complete.json").read_text())["after"]["heldOutRecordedPSNR"]
+        first = held if first is None else first
+        if held < first - args.max_drop:  # errors compound: each path is guided by the scene the last one left
+            raise SystemExit(f"{path}: held-out recorded views fell to {held} dB (first path {first}); stopping at {step}")
         if current != args.scene:
             shutil.rmtree(HERE / "viewer" / current)  # intermediate steps are ~0.4 GB each
         current = step

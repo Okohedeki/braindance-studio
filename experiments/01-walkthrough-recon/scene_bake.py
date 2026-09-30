@@ -66,6 +66,8 @@ def main():
     ap.add_argument("--lift-every", type=int, default=4, help="lift every Nth frame of a path")
     ap.add_argument("--lift-stride", type=int, default=4, help="new splats from every Nth pixel")
     ap.add_argument("--max-new", type=int, default=400000)
+    ap.add_argument("--carve-margin", type=float, default=0.05,
+                    help="drop a lifted splat if a recorded frame saw more than this (relative depth) past it")
     args = ap.parse_args()
     torch.manual_seed(0)
     random.seed(0)
@@ -198,6 +200,36 @@ def main():
         torch.cuda.empty_cache()
         if pts_all:
             pts, rgb, size = torch.cat(pts_all), torch.cat(rgb_all), torch.cat(size_all)
+            # free space: a recorded frame that shows a surface farther along the same ray (or sky) saw through
+            # the point, so nothing is there. Without this, lifted splats hang in front of recorded surfaces
+            # (held-out views fell 5 dB before fitting) and the next path's guides render that fog as geometry.
+            # the splat's centre and its extent along each axis (a centre behind a surface can still reach past it)
+            offs = torch.tensor([[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]],
+                                dtype=torch.float32, device="cuda") * 2
+            samples = (pts[:, None] + offs[None] * size[:, None, None]).reshape(-1, 3)
+            keep = torch.ones(len(samples), dtype=torch.bool, device="cuda")
+            for c2w, K, w, h, _ in recorded:
+                K4, w4, h4 = K.clone(), w // 2, h // 2
+                K4[:2] *= 0.5
+                with torch.no_grad():
+                    out_d, a_d, _ = rasterization(
+                        params["means"], F.normalize(params["quats"], dim=1), torch.exp(params["scales"]),
+                        torch.sigmoid(params["opacities"]), torch.cat([params["sh0"], params["shN"]], 1),
+                        torch.linalg.inv(c2w)[None], K4[None], w4, h4, sh_degree=0, rasterize_mode=mode,
+                        render_mode="ED")
+                depth_c, alpha_c = out_d[0, ..., 0], a_d[0, ..., 0]
+                w2c = torch.linalg.inv(c2w)
+                pc = samples @ w2c[:3, :3].T + w2c[:3, 3]
+                z = pc[:, 2]
+                u = torch.floor(pc[:, 0] / z.clamp(min=1e-6) * K4[0, 0] + K4[0, 2]).long()
+                v_ = torch.floor(pc[:, 1] / z.clamp(min=1e-6) * K4[1, 1] + K4[1, 2]).long()
+                ii = torch.nonzero((z > 1e-3) & (u >= 0) & (u < w4) & (v_ >= 0) & (v_ < h4), as_tuple=True)[0]
+                dd, aa = depth_c[v_[ii], u[ii]], alpha_c[v_[ii], u[ii]]
+                keep[ii[(aa < 0.5) | (z[ii] < dd * (1 - args.carve_margin))]] = False
+            keep = keep.reshape(len(pts), len(offs)).all(1)
+            print(f"free space: {int((~keep).sum())} of {len(pts)} lifted points lie where a recorded frame "
+                  f"saw through them, dropped", flush=True)
+            pts, rgb, size = pts[keep], rgb[keep], size[keep]
             q = torch.floor(pts / (size.median() * 0.5)).long()  # overlapping frames see the same surface: merge
             _, inv = torch.unique(q, dim=0, return_inverse=True)
             k = int(inv.max()) + 1
