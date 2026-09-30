@@ -58,7 +58,14 @@ def main():
     ap.add_argument("--stride", type=int, default=6, help="try an anchor every this many recorded frames")
     ap.add_argument("--spacing", type=int, default=18, help="chosen anchors at least this many recorded frames apart")
     ap.add_argument("--near", type=float, default=0.2, help="near plane for the guide, x median surface distance")
+    ap.add_argument("--mode", choices=["turn", "walk"], default="turn",
+                    help="turn: turn on the spot at a recorded frame. walk: walk forward from it into the free "
+                         "space and turn to look back, the way a free camera in the viewer moves")
+    ap.add_argument("--walk", type=float, default=1.4, help="walk mode: how far, x median surface distance")
+    ap.add_argument("--first", type=int, help="number the new paths from pNN (default: 0 for turn, 10 for walk); "
+                                              "existing paths are kept")
     args = ap.parse_args()
+    first = args.first if args.first is not None else (0 if args.mode == "turn" else 10)
 
     pkg = HERE / "viewer" / args.scene
     work = HERE / "work" / (args.work or args.scene.split("-")[0])
@@ -91,26 +98,78 @@ def main():
         alpha = alpha[0, ..., 0]
         return (out_img[0, ..., 0] / alpha.clamp(min=1e-4)).clamp(0, 1), out_img[0, ..., 1], alpha
 
-    if out.exists():
-        shutil.rmtree(out)
+    def heading(c2w0):
+        h = c2w0[:3, 2] - c2w0[:3, 2] @ up * up
+        return h / np.linalg.norm(h)
+
+    def build(c2w0, deg, reach):
+        """The camera path: turn mode turns on the spot and drifts toward the turn's end; walk mode walks
+        forward along the recorded heading, turning over the second part of the walk."""
+        path = []
+        for i in range(FRAMES):
+            m = c2w0.copy()
+            if args.mode == "turn":
+                t = smooth((i - args.hold) / (FRAMES - 1 - 2 * args.hold))
+                ahead = turn(up, deg) @ c2w0[:3, 2]
+                ahead -= ahead @ up * up
+                m[:3, :3] = turn(up, deg * t) @ c2w0[:3, :3]
+                m[:3, 3] = c2w0[:3, 3] + ahead / np.linalg.norm(ahead) * reach * t
+            else:
+                t_move = smooth((i - args.hold) / (FRAMES - 1 - args.hold))
+                t_turn = smooth((i - args.hold - 0.3 * FRAMES) / (FRAMES - 1 - args.hold - 0.3 * FRAMES))
+                m[:3, :3] = turn(up, deg * t_turn) @ c2w0[:3, :3]
+                m[:3, 3] = c2w0[:3, 3] + heading(c2w0) * reach * t_move
+            path.append(m)
+        return path
+
+    def walk_reach(c2w0):
+        """How far the camera can walk along the recorded heading, staying in free space with some clearance."""
+        reach = min(args.walk * free.unit, 0.8 * free.run(c2w0[:3, 3], heading(c2w0)))
+        for _ in range(4):
+            if all(free.free(c2w0[:3, 3] + heading(c2w0) * reach * t, clearance=0.05 * free.unit)
+                   for t in np.linspace(0.1, 1, 10)):
+                return reach
+            reach *= 0.75
+        return 0.0
+
+    def score_view(m, Ks):
+        recorded, depth, alpha = guide(m, Ks, 256, 144)
+        covered = alpha > 0.5
+        cover = float(covered.float().mean())
+        if cover < 0.6:
+            return None
+        d = depth[covered]
+        if float(d.median()) < 0.5 * free.unit or float((d < 0.3 * free.unit).float().mean()) > 0.1:
+            return None  # facing something too close to guide a camera move
+        return float(((1 - recorded) * alpha).sum() / alpha.sum()), cover
+
+    for old in out.glob("p[0-9][0-9]"):
+        if first <= int(old.name[1:]) < first + args.paths:
+            shutil.rmtree(old)
     candidates = []
     for k in range(0, len(frames), args.stride):
         f = frames[k]
         c2w0 = np.asarray(f["c2w"], np.float64)
         Ks, _, _ = intrinsics(f, 256, 144)
-        for deg in [d for d in range(-180, 181, 30) if d]:
-            m = c2w0.copy()
-            m[:3, :3] = turn(up, deg) @ c2w0[:3, :3]
-            recorded, depth, alpha = guide(m, Ks, 256, 144)
-            covered = alpha > 0.5
-            cover = float(covered.float().mean())
-            if cover < 0.6:
+        if args.mode == "turn":
+            for deg in [d for d in range(-180, 181, 30) if d]:
+                m = c2w0.copy()
+                m[:3, :3] = turn(up, deg) @ c2w0[:3, :3]
+                sv = score_view(m, Ks)
+                if sv:
+                    candidates.append((sv[0] * sv[1], k, f, deg, sv[0], sv[1]))
+        else:
+            reach = walk_reach(c2w0)
+            if reach < 0.5 * free.unit:
                 continue
-            unrecorded = float(((1 - recorded) * alpha).sum() / alpha.sum())
-            d = depth[covered]
-            if float(d.median()) < 0.5 * free.unit or float((d < 0.3 * free.unit).float().mean()) > 0.1:
-                continue  # facing something too close to guide a camera move
-            candidates.append((unrecorded * cover, k, f, deg, unrecorded, cover))
+            for deg in (-180, -150, -120, -90, 90, 120, 150):
+                path = build(c2w0, deg, reach)
+                svs = [score_view(path[i], Ks) for i in (FRAMES // 2, 3 * FRAMES // 4, FRAMES - 1)]
+                if any(v is None for v in svs):
+                    continue
+                unrecorded = float(np.mean([v[0] for v in svs]))
+                cover = float(np.mean([v[1] for v in svs]))
+                candidates.append((unrecorded * cover, k, f, deg, unrecorded, cover))
     plans = []
     for score, k, f, deg, unrecorded, cover in sorted(candidates, key=lambda c: -c[0]):
         if unrecorded < args.min_unrecorded or len(plans) == args.paths:
@@ -118,27 +177,23 @@ def main():
         if any(abs(k - q[0]) < args.spacing for q in plans):
             continue
         plans.append((k, f, deg, unrecorded, cover))
-        print(f"{f['name']}: turn {deg:+d} deg ({unrecorded:.0%} unrecorded, {cover:.0%} covered)", flush=True)
+        print(f"{f['name']}: {args.mode} {deg:+d} deg ({unrecorded:.0%} unrecorded, {cover:.0%} covered)", flush=True)
     plans.sort(key=lambda q: q[0])
 
     for n, (_, f, deg, unrecorded, cover) in enumerate(plans):
-        d = out / f"p{n:02d}"
+        d = out / f"p{first + n:02d}"
         for sub in ("depth", "teach", "render"):
             (d / sub).mkdir(parents=True, exist_ok=True)
         c2w0 = np.asarray(f["c2w"], np.float64)
         K, s, crop = intrinsics(f, W, H)
-        # drift toward where the turn ends, only as far as the free space allows (parallax for the fit)
-        ahead = turn(up, deg) @ c2w0[:3, 2]
-        ahead -= ahead @ up * up
-        ahead /= np.linalg.norm(ahead)
-        reach = min(args.drift * free.unit, 0.8 * free.run(c2w0[:3, 3], ahead))
-        path = []
-        for i in range(FRAMES):
-            t = smooth((i - args.hold) / (FRAMES - 1 - 2 * args.hold))
-            m = c2w0.copy()
-            m[:3, :3] = turn(up, deg * t) @ c2w0[:3, :3]
-            m[:3, 3] = c2w0[:3, 3] + ahead * reach * t
-            path.append(m)
+        if args.mode == "turn":
+            # drift toward where the turn ends, only as far as the free space allows (parallax for the fit)
+            ahead = turn(up, deg) @ c2w0[:3, 2]
+            ahead -= ahead @ up * up
+            reach = min(args.drift * free.unit, 0.8 * free.run(c2w0[:3, 3], ahead / np.linalg.norm(ahead)))
+        else:
+            reach = walk_reach(c2w0)
+        path = build(c2w0, deg, reach)
         depths, teach = [], []
         for i, m in enumerate(path):
             with torch.no_grad():
@@ -161,12 +216,12 @@ def main():
         left = round(crop)
         image.crop((left, 0, left + W, H)).save(d / "first.png")
         (d / "cameras.json").write_text(json.dumps({
-            "scene": args.scene, "anchor": f["name"], "turnDeg": deg, "driftUnits": round(float(reach), 4),
+            "scene": args.scene, "anchor": f["name"], "mode": args.mode, "turnDeg": deg, "driftUnits": round(float(reach), 4),
             "unrecordedAtEnd": round(unrecorded, 3), "W": W, "H": H, "fps": FPS, "K": K.cpu().tolist(),
             "c2w": [m.tolist() for m in path], "neverRecordedShare": [round(x, 3) for x in teach],
             "depthEncoding": {"near": float(near), "far": float(far), "code": "1 - log-normalised depth, far clamped; 0 = empty"}},
             indent=1))
-        print(f"p{n:02d} {f['name']}: {FRAMES} frames, turn {deg:+d} deg, drift {reach / free.unit:.2f} x unit, "
+        print(f"p{first + n:02d} {f['name']}: {FRAMES} frames, {args.mode} {deg:+d} deg, {reach / free.unit:.2f} x unit, "
               f"never recorded {np.mean(teach):.0%} of the path's pixels", flush=True)
     print(f"{len(plans)} paths -> {out}")
 

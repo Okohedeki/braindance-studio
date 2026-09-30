@@ -38,9 +38,13 @@ def prompt_for(cams, caption):
     left = float((c1[:3, 2] - c0[:3, 2]) @ c0[:3, 0]) < 0  # the view swings toward the camera's -x
     side = "left" if left else "right"
     place = f"{caption.rstrip('.')}. " if caption else ""
-    return (f"{place}A smooth, slow, steady camera pan in this same place: from the first frame the camera turns "
-            f"about {abs(cams['turnDeg'])} degrees to the {side} on the spot, revealing the rest of the same space "
-            f"around it, which continues the same architecture, materials and light. Photoreal real-estate "
+    if cams.get("mode") == "walk":
+        move = (f"from the first frame the camera walks slowly forward through the space, then turns about "
+                f"{abs(cams['turnDeg'])} degrees to the {side} to look back at where it came from")
+    else:
+        move = f"from the first frame the camera turns about {abs(cams['turnDeg'])} degrees to the {side} on the spot"
+    return (f"{place}A smooth, slow, steady camera move in this same place: {move}, revealing the rest of the same "
+            f"space around it, which continues the same architecture, materials and light. Photoreal real-estate "
             f"walkthrough video, natural daylight, consistent lighting, realistic detail, sharp focus.")
 
 
