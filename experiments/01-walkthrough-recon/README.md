@@ -32,6 +32,8 @@ Four 4K clips of one modern house by Kindel Media on Pexels, used under the [Pex
 
 ## Reproduce (Windows, NVIDIA GPU)
 
+The core setup is below. For every stage (SAM 3.1, SEVA, Qwen3.5, imajev, ComfyUI with LTX-2.3), the model downloads and the full courtyard chain, see [docs/INSTALL.md](../../docs/INSTALL.md).
+
 ```bash
 # 1. Environment (Python 3.10, PyTorch 2.4.1 + CUDA 12.4, prebuilt gsplat wheel)
 uv venv --python 3.10 .venv-recon
