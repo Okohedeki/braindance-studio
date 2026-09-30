@@ -54,7 +54,7 @@ Every stage writes its own viewer package (`viewer/<scene>-<stage>/`), so you ca
 
 **Courtyard results** (held-out recording frames, half resolution):
 - **Score:** 28.9 dB PSNR, with 2.6M splats. Of those, 17% are recorded, 4% recorded once, 13% filled, 22% inferred, 2% rebuilt and 42% completed.
-- **Compute:** about half a day on one RTX 4090, from video to the final scene.
+- **Compute:** about 5 hours on one RTX 4090, from video to the final scene.
 
 The full research log, with every number, failure and fix, is in [`experiments/01-walkthrough-recon/README.md`](experiments/01-walkthrough-recon/README.md).
 
