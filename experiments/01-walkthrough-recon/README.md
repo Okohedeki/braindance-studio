@@ -575,3 +575,15 @@ It costs 0.9 dB from the recording cameras.
 | Lying flat | 17.5% | 28.6% | 28.6% |
 
 Off the path, `courtyard-final` looks like the refined scene (`work/captures/courtyard_roam_final.mp4`). Polishing opacity as well reached 29.30 dB, but brought back streaks on walls and a smear on a planter off the path: opacity revives the cards that only suit the recorded angles.
+
+## Sharpening still views (Difix in the render worker)
+
+Everything baked into the splats stays a little soft off the path, because repairs of neighbouring views disagree in detail and training averages them (see the roam pass). A single Difix repair doesn't have that problem: it is sharp. The GPU worker therefore repairs the view you stop on.
+
+- **When:** the camera hasn't moved for 450 ms. The viewer asks for one more frame with `sharpen`, and moving again returns straight to live frames. **Sharpen still views (X)** turns it off.
+- **How:** the worker picks the recorded frame that sees most of the view's surfaces from the most similar direction (the roam pass's choice). It runs Difix (`difix_ref`, half precision, at most 1280 px wide, resized back to the frame) with that frame as the reference. Difix loads in the background when the worker starts (about 1 min); frames render normally meanwhile.
+- **Only where it's true:** views that are less than 50% recorded (recorded + recorded once in the trust map) are left alone. There, with nothing true to guide it, Difix invents: the unfilmed garden became an indoor wall with steps. Views with the trust view or object edits showing are left alone too.
+- **Labelled:** the badge reads "Sharpened by Difix · repaired, not recorded", and its tooltip names the reference frame. Skipped views say why ("Not sharpened: only 26% of this view was recorded").
+- **Speed:** about 1–1.5 s per view on the 4090 at 1280×720; 1.8 s round trip at 2.5 MP.
+
+On the courtyard (`work/captures/courtyard_sharpen_test.jpg`), free-roam views of the olive tree and planters go from soft to photographic, and the living room gets clean edges. Difix still invents small things behind glass.

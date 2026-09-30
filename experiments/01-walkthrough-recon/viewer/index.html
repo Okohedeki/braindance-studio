@@ -172,6 +172,7 @@
     <label class="check" id="inferredRow" hidden title="Tint violet the parts added for what the recording never saw: generated guesses, not reconstruction (I)"><input type="checkbox" id="inferredToggle"> Show what's inferred (I)</label>
     <label class="check" id="trustRow" hidden title="Colour every pixel by where it came from: recorded, recorded from one angle, filled, inferred, rebuilt or completed (T)"><input type="checkbox" id="trustToggle"> Show where each pixel came from (T)</label>
     <div id="trustLegend" hidden aria-live="polite"></div>
+    <label class="check" id="sharpenRow" hidden title="When the camera stops, repair the view with Difix, guided by the recorded frame that sees the same surfaces. Only views that are mostly recorded; labelled when it happens (X)"><input type="checkbox" id="sharpenToggle" checked> Sharpen still views (X)</label>
     <p class="hint" id="modeHint">Drag to step out of the recording camera.</p>
     <div id="objectsSection">
       <h2>Objects</h2>
@@ -620,12 +621,16 @@ function updateRendererUI() {
     : active ? `gsplat on the GPU (${gpu.backend}), the renderer the scene was trained with.`
     : "Rendering in the browser (Spark).";
   $("viewBadge").textContent = coverageOn ? "Reconstructed · coverage"
-    : active ? "Reconstructed · GPU render" : "Reconstructed · browser render";
+    : active ? (sharp.status || "Reconstructed · GPU render") : "Reconstructed · browser render";
+  $("viewBadge").title = active ? sharp.title : "";
   updateObjectsHint();
 }
 $("gpuBtn").onclick = () => { preferGpu = true; updateRendererUI(); };
 $("localBtn").onclick = () => { preferGpu = false; updateRendererUI(); };
 
+// Still-view sharpening state (see requestGpuFrame).
+const sharp = { on: true, changedAt: 0, doneKey: null, status: "", title: "" };
+$("sharpenToggle").onchange = (e) => { sharp.on = e.target.checked; sharp.doneKey = null; gpu.lastKey = null; };
 function connectWorker() {
   let ws;
   try { ws = new WebSocket(workerUrl); } catch { return; }
@@ -634,7 +639,9 @@ function connectWorker() {
     if (typeof ev.data === "string") {
       const msg = JSON.parse(ev.data);
       if (msg.type === "hello") {
-        Object.assign(gpu, { ws, ready: msg.capabilities?.includes("render"), device: msg.device, backend: msg.backend });
+        Object.assign(gpu, { ws, ready: msg.capabilities?.includes("render"), device: msg.device, backend: msg.backend,
+                             canSharpen: msg.capabilities?.includes("sharpen") });
+        $("sharpenRow").hidden = !gpu.canSharpen;
         updateRendererUI();
       } else if (msg.type === "error") {
         gpu.inFlight = 0;
@@ -652,6 +659,14 @@ function connectWorker() {
     if (waiter) { gpu.waiters.delete(header.id); waiter.resolve(jpeg); return; }
     gpu.ms = header.renderMs + header.encodeMs;
     if (header.trust) showTrustShares(header.trust);
+    sharp.status = header.sharpened?.model ? "Sharpened by Difix · repaired, not recorded"
+      : header.sharpened?.skipped ? `Not sharpened: ${header.sharpened.skipped}` : "";
+    sharp.title = header.sharpened?.model
+      ? `${header.sharpened.model}, guided by recorded frame ${header.sharpened.reference} (${header.sharpened.ms} ms)` : "";
+    if (gpuActive() && !coverageOn) {
+      $("viewBadge").textContent = sharp.status || "Reconstructed · GPU render";
+      $("viewBadge").title = sharp.title;
+    }
     gpu.rtt = performance.now() - gpu.sentAt;
     createImageBitmap(jpeg).then((bmp) => {
       if (header.id <= gpu.shownId) return;  // never draw over a newer frame
@@ -694,16 +709,28 @@ function gpuSize() {
   return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
 }
 
+// Still views can be sharpened: once the view has stopped changing for a
+// moment, one more frame is requested with Difix repair (the worker skips it,
+// and says why, for views that are mostly not recorded).
+
 function requestGpuFrame() {
   if (gpu.inFlight || !gpu.ws) return;
   const [w, h] = gpuSize();
   const req = gpuRequest(w, h, [BG.r, BG.g, BG.b]);
   const key = `${w}x${h}:${req.c2w.map((v) => v.toFixed(5)).join(",")}:${camera.fov.toFixed(3)}`
     + `:${objects.version}:${objects.show}:${objects.focus}:${showInferred}:${showTrust}:${objects.editVersion}`;
-  if (key === gpu.lastKey) return;
-  gpu.lastKey = key;
+  const now = performance.now();
+  if (key === gpu.lastKey) {
+    if (!sharp.on || !gpu.canSharpen || sharp.doneKey === key || now - sharp.changedAt < 450 || showTrust || req.edits) return;
+    req.sharpen = true;
+    sharp.doneKey = key;
+  } else {
+    gpu.lastKey = key;
+    sharp.changedAt = now;
+    sharp.doneKey = null;
+  }
   gpu.inFlight = req.id;
-  gpu.sentAt = performance.now();
+  gpu.sentAt = now;
   gpu.ws.send(JSON.stringify(req));
 }
 
@@ -1156,6 +1183,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "o" && objects.list.length) { $("objectsToggle").click(); }
   else if (k === "i" && meta.inferred) { $("inferredToggle").click(); }
   else if (k === "t" && trustInfo) { $("trustToggle").click(); }
+  else if (k === "x" && gpu.canSharpen) { $("sharpenToggle").click(); }
   else if (k === "Escape" && objects.focus) { focusObject(0); }
   else if ((k === "Delete" || k === "Backspace") && objects.focus) { $("editRemove").click(); }
   else if (k === "[" && objects.focus) { $("editTurnL").click(); }

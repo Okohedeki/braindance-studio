@@ -21,10 +21,14 @@ Protocol
       "trust" (optional bool: colour every pixel by where its splats came from, trust.bin
       from trust_map.py: recorded, recorded once, filled, inferred, rebuilt, completed),
       "edits" (optional {object id: {"hide": bool, "matrix": 16 floats, row-major, a rigid
-      transform in the scene frame}}: move, turn or remove objects placed by lift_objects.py)}
+      transform in the scene frame}}: move, turn or remove objects placed by lift_objects.py),
+      "sharpen" (optional bool: repair the frame with Difix, guided by the recorded frame that sees
+      most of the same surfaces from the most similar direction; for a still camera, ~0.3-0.6 s)}
   server -> client (binary): uint32 little-endian header length, JSON header
       {"type": "frame", "id", "renderMs", "encodeMs", "splats", and with trust "trust":
-      {class: share of the covered screen}}, then JPEG bytes
+      {class: share of the covered screen}, with sharpen "sharpened": {"model", "reference", "ms"} or
+      {"skipped": why, "ms"} (Difix loading, view mostly not recorded, trust or edits showing)},
+      then JPEG bytes
   server -> client (text) on failure: {"type": "error", "id", "message"}
 
 Only the newest request per connection is rendered: requests that arrive while
@@ -51,6 +55,9 @@ from gsplat.rendering import rasterization, rasterization_2dgs
 from torchvision.io import encode_jpeg
 
 VIEWER = Path(__file__).resolve().parent / "viewer"
+REPO = Path(__file__).resolve().parents[2]
+SHARPEN_MAX_WIDTH = 1280  # Difix runs at most this wide; the result is resized to the requested frame
+SHARPEN_MIN_RECORDED = 0.5  # sharpen only views mostly of recorded surfaces: elsewhere Difix invents (a garden -> a wall)
 SCENE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_SIZE = 4096
 SH_C0 = 0.28209479177387814  # degree-0 spherical harmonic: colour = 0.5 + SH_C0 * dc
@@ -187,6 +194,44 @@ class Scene:
             self.trust = (mtime, torch.tensor(data[0::2].astype(np.int64), device="cuda"))
         return self.trust[1]
 
+    def best_reference(self, c2w, K, w, h):
+        """Recorded frame that sees most of the view's surfaces from the most similar direction (as the Difix
+        roam pass chooses them), or None if the view shows too little."""
+        meta = json.loads((self.dir / "scene.json").read_text())
+        frames = [f for f in meta["frames"] if not f.get("heldOut")]
+        if not hasattr(self, "_ref_cams"):
+            c2ws = torch.tensor([f["c2w"] for f in frames], dtype=torch.float32, device="cuda")
+            Ks = torch.tensor([[[f["fx"], 0, f["cx"]], [0, f["fy"], f["cy"]], [0, 0, 1]] for f in frames],
+                              dtype=torch.float32, device="cuda")
+            whs = torch.tensor([[f["width"], f["height"]] for f in frames], dtype=torch.float32, device="cuda")
+            self._ref_cams = (c2ws, torch.linalg.inv(c2ws), Ks, whs, [f["name"] for f in frames])
+        rec_c2w, rec_w2c, rec_K, rec_wh, names = self._ref_cams
+        sc = 8
+        Ks = K.clone()
+        Ks[:2] /= sc
+        with torch.no_grad():
+            out, alpha, _ = rasterization(self.means, self.quats, self.scales, self.opacities, self.colors,
+                                          torch.linalg.inv(c2w)[None], Ks[None], max(w // sc, 8), max(h // sc, 8),
+                                          sh_degree=self.sh_degree, rasterize_mode=self.mode, render_mode="RGB+ED")
+        depth, alpha = out[0, ..., 3], alpha[0, ..., 0]
+        ys, xs = torch.nonzero(alpha > 0.5, as_tuple=True)
+        if len(ys) < 20:
+            return None
+        pick = torch.randperm(len(ys), device="cuda")[:1500]
+        ys, xs = ys[pick], xs[pick]
+        z = depth[ys, xs]
+        rays = torch.stack([(xs + 0.5 - Ks[0, 2]) / Ks[0, 0], (ys + 0.5 - Ks[1, 2]) / Ks[1, 1], torch.ones_like(z)], 1)
+        pts = (rays * z[:, None]) @ c2w[:3, :3].T + c2w[:3, 3]
+        pc = pts[None] @ rec_w2c[:, :3, :3].transpose(1, 2) + rec_w2c[:, None, :3, 3]
+        zc = pc[..., 2]
+        f = torch.stack([rec_K[:, 0, 0], rec_K[:, 1, 1]], 1)[:, None]
+        uv = pc[..., :2] / zc.clamp(min=1e-6)[..., None] * f + rec_K[:, None, :2, 2]
+        inside = (zc > 1e-3) & (uv >= 0).all(-1) & (uv < rec_wh[:, None]).all(-1)
+        to_new = torch.nn.functional.normalize(c2w[:3, 3] - pts, dim=1)
+        to_rec = torch.nn.functional.normalize(rec_c2w[:, None, :3, 3] - pts[None], dim=-1)
+        score = (inside * (to_rec * to_new[None]).sum(-1).clamp(min=0)).sum(1)
+        return names[int(score.argmax())]
+
     def edited(self, edits, opacities):
         """Means, quats and opacities with objects moved, turned or hidden."""
         if not edits:
@@ -282,6 +327,54 @@ class Renderer:
     def __init__(self, max_scenes=2):
         self.scenes = OrderedDict()
         self.max_scenes = max_scenes
+        self.difix = None  # Difix pipeline, loaded in the background (load_difix)
+        self.difix_error = None
+
+    def load_difix(self):
+        try:
+            import sys
+            sys.path.insert(0, str(REPO / "tools" / "Difix3D"))
+            from src.pipeline_difix import DifixPipeline
+            pipe = DifixPipeline.from_pretrained(str(REPO / "tools" / "models" / "difix_ref"), torch_dtype=torch.float16)
+            pipe.set_progress_bar_config(disable=True)
+            self.difix = pipe.to("cuda")
+            print("Difix loaded: still views can be sharpened", flush=True)
+        except Exception as e:  # sharpening stays off; rendering is unaffected
+            self.difix_error = str(e)
+            print(f"Difix not available: {e}", flush=True)
+
+    def sharpen(self, scene_name, s, img, c2w, K, w, h):
+        """Difix repair of a rendered frame [3, H, W] uint8, guided by the best recorded frame.
+        Returns (image, info) where info says what was done or why not."""
+        from PIL import Image
+        if self.difix is None:
+            return img, {"skipped": self.difix_error or "Difix is still loading"}
+        if s.load_trust() is not None:
+            small = K.clone()
+            small[:2] /= 8
+            _, _, shares = s.render(c2w, small, max(w // 8, 8), max(h // 8, 8), trust=True)
+            recorded = shares["recorded"] + shares["recorded once"]
+            if recorded < SHARPEN_MIN_RECORDED:
+                return img, {"skipped": f"only {recorded:.0%} of this view was recorded: nothing true to sharpen against"}
+        ref_name = s.best_reference(c2w, K, w, h)
+        if ref_name is None:
+            return img, {"skipped": "the view shows too little of the scene"}
+        work = VIEWER.parent / "work" / scene_name.split("-")[0]
+        ref_path = work / "train" / "images" / ref_name
+        if not ref_path.is_file():
+            ref_path = work / "images" / ref_name
+        if not ref_path.is_file():
+            return img, {"skipped": "no recorded frames on disk for this scene"}
+        sw = min(w, SHARPEN_MAX_WIDTH)
+        sh_ = max(8, round(h * sw / w) // 8 * 8)
+        sw = sw // 8 * 8
+        rendered = Image.fromarray(img.permute(1, 2, 0).cpu().numpy()).resize((sw, sh_), Image.BICUBIC)
+        ref = Image.open(ref_path).convert("RGB").resize((sw, sh_), Image.BICUBIC)
+        with torch.no_grad():
+            fixed = self.difix("remove degradation", image=rendered, ref_image=ref, num_inference_steps=1,
+                               timesteps=[199], guidance_scale=0.0).images[0].resize((w, h), Image.BICUBIC)
+        out = torch.from_numpy(np.asarray(fixed).copy()).permute(2, 0, 1).contiguous().cuda()
+        return out, {"model": "difix_ref (Difix3D+)", "reference": ref_name}
 
     def scene(self, name):
         if not SCENE_NAME.match(name) or not (VIEWER / name / "scene.ply").is_file():
@@ -314,6 +407,14 @@ class Renderer:
             # fails a shape check in packed mode).
             img = img + (1 - alpha) * bg
             img = (img.clamp(0, 1) * 255).to(torch.uint8).permute(2, 0, 1).contiguous()
+            sharpened = None
+            if req.get("sharpen"):
+                if req.get("trust") or req.get("edits"):  # the reference shows the unedited world
+                    sharpened = {"skipped": "not while showing trust or edits"}
+                else:
+                    ts = time.perf_counter()
+                    img, sharpened = self.sharpen(str(req["scene"]), s, img, c2w, K, w, h)
+                    sharpened["ms"] = round((time.perf_counter() - ts) * 1000)
             torch.cuda.synchronize()
             t1 = time.perf_counter()
             jpeg = encode_jpeg(img, quality=int(req.get("quality", 90))).cpu().numpy().tobytes()
@@ -322,6 +423,8 @@ class Renderer:
                   "encodeMs": round((t2 - t1) * 1000, 2), "splats": s.count}
         if shares is not None:
             header["trust"] = shares
+        if sharpened:
+            header["sharpened"] = sharpened
         return header, jpeg
 
 
@@ -329,12 +432,16 @@ async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8791)
     ap.add_argument("--allow-origin", nargs="*", default=["http://localhost:8790", "http://127.0.0.1:8790"])
+    ap.add_argument("--no-sharpen", action="store_true", help="don't load Difix (still-view sharpening off)")
     args = ap.parse_args()
 
     renderer = Renderer()
     pool = ThreadPoolExecutor(max_workers=1)  # one GPU, one queue
+    if not args.no_sharpen:
+        import threading
+        threading.Thread(target=renderer.load_difix, daemon=True).start()
     hello = json.dumps({"type": "hello", "backend": f"gsplat {gsplat_version}",
-                        "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects", "inferred", "trust", "edits"]})
+                        "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects", "inferred", "trust", "edits", "sharpen"]})
     loop = asyncio.get_running_loop()
 
     async def handler(ws):
