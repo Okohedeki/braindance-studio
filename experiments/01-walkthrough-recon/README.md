@@ -536,3 +536,33 @@ The infer pass (SEVA) filled what the recording never saw, but its guesses are s
 - More, longer paths with overlap, so neighbouring paths agree.
 - Letting completion add splats where the scene has none (it only re-colours and reshapes what the infer pass placed).
 - A multi-view check that drops generated content paths disagree on.
+
+The courtyard package now uses paths p00, p01, p02 and p05 only (`--skip-paths p03 p04`): p04 left a blue cast on the paving and p03 drifted toward armchairs. Held-out 28.98 dB.
+
+## Geometry refinement: surfaces that hold up from any angle
+
+A free-roam wander through the completed courtyard (`roam_flythrough.py`, 16 waypoints) showed that the main problem off the path isn't what the recording never saw. Surfaces it did see break up: glassy shards on the outdoor paving, long streaks on hallway walls. The splats are thin cards and needles that only look right from the recorded angles (see "Going vertical"). A COLMAP-point depth loss and 2DGS self-consistency didn't fix that on the house. The missing piece was a dense prior on what the surfaces are, and MoGe-2 (already downloaded for the infer pass) gives one per image.
+
+`geometry_refine.py --scene courtyard-complete --out courtyard-refined --views run_courtyard-roam --generated --skip-paths p03 p04` fine-tunes the scene, same splats in the same order:
+- **Recorded frames (355):** RGB as trained, plus MoGe-2 depth (scale-aligned to the scene per frame, so it only shapes) and MoGe-2 normals. They're compared with the rendered depth and with a rendered normal map, each splat's shortest axis turned toward the camera.
+- **Repaired free-roam views (700 of the roam pass's 1,297 Difix repairs):** RGB and MoGe-2 normals, only where the trust map says the view shows recorded surfaces.
+- **Generated completion paths (176 frames of p00, p01, p02, p05):** RGB, depth and normals only in pixels no frame recorded. Recorded splats are frozen on those steps.
+- **A disc penalty:** each splat's thinnest axis relative to its middle one, with the middle axis held fixed in the penalty. No splat may grow past 1.5× its starting size.
+
+15,000 steps, 9.4 min on the 4090 (MoGe-2 on 1,231 images first: 2 min).
+
+| | completed | refined |
+|---|---|---|
+| Held-out PSNR from the recording cameras | 28.98 dB | 28.08 dB |
+| Opacity share of splats lying flat (normal within 30° of up) | 17.5% | 28.6% |
+| Splat size, median / 99th percentile (scene units) | 0.016 / 0.171 | 0.016 / 0.166 |
+| Render time, 1909×1064 | 4.8 ms | 4.0 ms |
+
+**Side by side** (`work/captures/courtyard_roam_refined.mp4`, `courtyard_refine_before_after.jpg`):
+- Outdoors, the paving goes from glassy shards to flat stone with tile detail. Streaky glass and wall views become clean walls, and potted plants, the tree in its pot and the glass door come out cleanly.
+- The view facing the unfilmed garden shows some of the completed structure but is still rough.
+- Indoors (hallway, stairwell), views are about as soft as before.
+
+It costs 0.9 dB from the recording cameras.
+
+**What went wrong on the way:** the first version penalised thinnest / middle axis, and splats satisfied it by growing their middle axis. The 99th-percentile splat grew 15× and a generated view took 36× the tile work (1.2M → 43.5M intersections). A second round then filled the GPU and thrashed. Its roam sheet looked smoother, from blur rather than geometry, and its held-out loss was smaller (0.45 dB) for the same reason. With the middle axis held fixed and the size cap, splat sizes don't move.
