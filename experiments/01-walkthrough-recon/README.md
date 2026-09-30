@@ -587,3 +587,28 @@ Everything baked into the splats stays a little soft off the path, because repai
 - **Speed:** about 1–1.5 s per view on the 4090 at 1280×720; 1.8 s round trip at 2.5 MP.
 
 On the courtyard (`work/captures/courtyard_sharpen_test.jpg`), free-roam views of the olive tree and planters go from soft to photographic, and the living room gets clean edges. Difix still invents small things behind glass.
+
+## Walking off the path: where it still turns to glass
+
+A screen recording from the viewer (free camera, W from the start of the walk) found the next problem:
+- **What happens:** a straight move forward from the terrace stays clean right up to the sofa. Past the sofa, turning toward the olive tree and back, the view turns to glass and fog.
+- **What's in that view:** from there, half of it was never recorded (trust view). The sofa's rebuilt back is at 0.8–1.6 m (about 9,000 rebuilt splats fitted to an orbit at about 4 m), and completed ground surrounds it.
+- **Why the paths didn't help:** the completion paths had only turned on the spot at recorded positions, so no generated frame came from there.
+
+**Ruled out** (`work/review/userclip/`):
+- Turning off view-dependent colour (spherical harmonics beyond degree 0): no change.
+- Removing splats with almost no weight in any recorded frame: no change. The dark needles in front of walls are real, weighted splats of the wall and planter, sub-pixel at recording distance.
+- Mip-Splatting's 3D smoothing filter applied after training: darkens the scene. Most splats are paper-thin, and its opacity compensation empties them; it only works when trained with it.
+- A near plane or near fade: the fog isn't at the lens.
+
+**Walk paths** (`scene_paths.py --mode walk`). From a recorded frame the camera walks along its heading, as far as free space allows (up to 1.4× the median surface distance, about 2.9 m), turning 90–180° over the second part to look back. Five paths, all on the terrace (anchors at frames 2, 22, 50, 70, 91), turning 120–150°. LTX's frames for them are coherent: past the sofa, looking back at the pergola, the garden and the boundary wall.
+
+**Fitted all at once, they don't hold** (`viewer/courtyard-final2`, `work/captures/walk_p13.mp4`):
+- Held-out PSNR from the recording cameras is 28.87 dB and never-recorded pixels match the generated frames at 24.3 dB (was 21.2).
+- Along the walk itself, though, the look-back views go from glassy to foggy rather than to what LTX drew.
+- The five paths were generated independently from the same scene and disagree where they overlap, and fitting them all averages the disagreement into blur. The fit could also only re-colour and reshape splats the infer pass had put at rough depths.
+
+`complete_walk.py` completes the paths one at a time instead:
+- each path's guides are rendered again from the scene as it now is;
+- LTX is anchored to that render at frames 32, 64 and 96;
+- the path's never-recorded pixels are lifted into new splats at MoGe-2 depth (aligned to the recorded surfaces in the same frame) before the fit.
