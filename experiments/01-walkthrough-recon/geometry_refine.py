@@ -78,6 +78,11 @@ def main():
                          "frame recorded, with recorded splats frozen on those steps")
     ap.add_argument("--gen-prob", type=float, default=0.2, help="share of steps on generated path frames")
     ap.add_argument("--skip-paths", nargs="*", default=[], help="generated paths to leave out")
+    ap.add_argument("--polish", type=int, default=3000,
+                    help="then this many steps on the recorded frames training only colour (--polish-params), the new "
+                         "geometry held, to win back what the priors cost from the recording cameras")
+    ap.add_argument("--polish-params", nargs="+", default=["sh0", "shN"],
+                    help="what the polish trains (opacity too revived streaks off the path)")
     args = ap.parse_args()
     torch.manual_seed(0)
     random.seed(0)
@@ -306,6 +311,19 @@ def main():
             params["scales"].copy_(torch.minimum(params["scales"], scale_cap))
         if step % 3000 == 0:
             print(f"  step {step}/{args.steps}", flush=True)
+    refined = {"heldOutPSNR": held_out(), "lyingFlat": facing(), "splatSizeP50P99": sizes()}
+    print(f"refined: {refined}", flush=True)
+    for step in range(args.polish):
+        v = random.choice(recorded)
+        pred, _, _ = render(v["c2w"], v["K"], v["w"], v["h"])
+        gt = v["img"].to("cuda", non_blocking=True).float() / 255
+        loss = 0.8 * (pred - gt).abs().mean() + 0.2 * (1 - fused_ssim(pred.permute(2, 0, 1)[None],
+                                                                     gt.permute(2, 0, 1)[None], padding="valid"))
+        loss.backward()
+        for k in args.polish_params:
+            opts[k].step()
+        for o in opts.values():
+            o.zero_grad(set_to_none=True)
     minutes = (time.time() - t0) / 60
     after = {"heldOutPSNR": held_out(), "lyingFlat": facing(), "splatSizeP50P99": sizes()}
     print(f"after: {after} ({minutes:.1f} min)", flush=True)
@@ -329,7 +347,8 @@ def main():
     report = {"scene": args.scene, "out": args.out, "recordedFrames": len(recorded), "roamViews": len(views),
               "generatedFrames": len(generated),
               "steps": args.steps, "weights": {"depth": args.depth_weight, "normal": args.normal_weight, "flat": args.flat_weight},
-              "before": before, "after": after, "minutes": round(minutes, 1)}
+              "polishSteps": args.polish, "before": before, "refined": refined, "after": after,
+              "minutes": round(minutes, 1)}
     (out / "refine.json").write_text(json.dumps(report, indent=1))
     print(f"-> {out} (run trust_map.py --scene {args.out})")
 

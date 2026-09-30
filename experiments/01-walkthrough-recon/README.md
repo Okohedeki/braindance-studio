@@ -566,3 +566,12 @@ A free-roam wander through the completed courtyard (`roam_flythrough.py`, 16 way
 It costs 0.9 dB from the recording cameras.
 
 **What went wrong on the way:** the first version penalised thinnest / middle axis, and splats satisfied it by growing their middle axis. The 99th-percentile splat grew 15× and a generated view took 36× the tile work (1.2M → 43.5M intersections). A second round then filled the GPU and thrashed. Its roam sheet looked smoother, from blur rather than geometry, and its held-out loss was smaller (0.45 dB) for the same reason. With the middle axis held fixed and the size cap, splat sizes don't move.
+
+**A colour polish wins back the recording cameras.** After the priors, 3,000 steps on the recorded frames train only colour (`--polish 3000`, `--polish-params sh0 shN`), with the new geometry and opacity held. 1 min.
+
+| | completed | refined | refined + colour polish (`viewer/courtyard-final`) |
+|---|---|---|---|
+| Held-out PSNR from the recording cameras | 28.98 dB | 28.08 dB | 28.75 dB |
+| Lying flat | 17.5% | 28.6% | 28.6% |
+
+Off the path, `courtyard-final` looks like the refined scene (`work/captures/courtyard_roam_final.mp4`). Polishing opacity as well reached 29.30 dB, but brought back streaks on walls and a smear on a planter off the path: opacity revives the cards that only suit the recorded angles.
