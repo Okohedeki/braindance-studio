@@ -612,3 +612,38 @@ A screen recording from the viewer (free camera, W from the start of the walk) f
 - each path's guides are rendered again from the scene as it now is;
 - LTX is anchored to that render at frames 32, 64 and 96;
 - the path's never-recorded pixels are lifted into new splats at MoGe-2 depth (aligned to the recorded surfaces in the same frame) before the fit.
+
+**First run: worse, and the failure fed itself** (`viewer/courtyard-walk`, `work/captures/walk_p13_v2.mp4`):
+- Recorded views that were clean before went hazy, and past the sofa the walk became a green blur.
+- The lifted splats landed in space the recording shows as empty. Straight after lifting p10, before any fitting, held-out recorded views fell from 28.75 to 23.09 dB.
+- The damage compounded. The next path's guides rendered that fog as near geometry and counted it as never recorded (p13: 82% of its views; even at its recorded start frame the never-recorded mask was mostly white). LTX then drew close-up foliage into it (`work/review/p13_gen_sheet.jpg`).
+- It ended at 3.59M splats, 58% of them completed, with held-out 27.91 dB.
+
+**Free space fixes it** (`scene_bake.py`, on by default for `--lift`). The lifted points are checked against every recorded training frame at quarter resolution. A point is dropped if that frame shows a surface more than 5% farther along the same ray, or shows nothing there (alpha < 0.5): the camera saw through it. Each splat's extent is tested as well as its centre (±2 sizes along each axis), since a centre behind a surface can still reach past it.
+
+| p10, lifted and fitted | Held-out recorded, before fit | After 4000 steps | Never-recorded vs LTX |
+|---|---|---|---|
+| no lift | 28.75 | | |
+| lift, no free-space check | 23.09 | 27.91 | 25.42 |
+| lift, centre only | 27.71 | | |
+| lift, centre and extent | 28.15 | 28.75 | 25.60 |
+
+Between a third and two thirds of each path's lifted points go (p10 49%, p11 63%, p12 59%, p13 49%, p14 31%).
+
+`complete_walk.py` also stops if a path's fit drops held-out recorded views more than 0.5 dB below the first path's, since each path is guided by what the one before left.
+
+**Second run** (`viewer/courtyard-walk2`; p10 as above, then p11–p14 one at a time; log in `work/courtyard/complete_walk2.log`):
+
+| Path | Never recorded along it (first run → now) | Held-out after fit | Never-recorded vs LTX |
+|---|---|---|---|
+| p11 | 41% → 31% | 28.74 | 25.13 |
+| p12 | 64% → 39% | 28.76 | 24.65 |
+| p13 | 82% → 46% | 28.73 | 24.60 |
+| p14 | 60% → 39% | 28.71 | 25.00 |
+
+After geometry refinement and colour polish, held-out PSNR is 28.91 dB (courtyard-final 28.75, courtyard-final2 28.87). The scene has 2.60M splats: 17% recorded, 4% recorded once, 13% filled, 22% inferred, 2% rebuilt, 42% completed.
+
+**What changed, and what didn't:**
+- **Past the sofa (p13, `work/captures/walk_p13_v3.mp4`), better.** The first half matches the recording as before. Behind the sofa you see the terrace, palm, planter and glass doors; in the first run the same view was fog. Looking back at the end you get sky, the far buildings in evening light, the boundary wall and planting where there was glass: soft, but a place.
+- **End of p11 (`work/captures/walk_p11_v3.mp4`), still murky.** The camera finishes almost against the planting next to the sofa. LTX's frames there are clean (trees, wall, pergola; `work/review/p11_gen_sheet_v2.jpg`), but they don't agree with the scene's guide at those frames. The fit holds its middle frames and not these last ones.
+- **Free roam at 1.4× reach (`work/captures/courtyard_roam_walk2.mp4`), little change.** This test spends most of its time pressed against walls and the pergola ceiling. It is only better in the garden stretch.
