@@ -12,8 +12,9 @@ was recorded, and gets a small learned camera correction (LTX follows the
 guide closely, not exactly).
 
 Writes viewer/<out>: the scene with the fitted splats (same splats in the
-same order, so objects, free space and flags still apply), inferred.bin with
-3 on every splat the completion changed, and complete.json with the numbers.
+same order, so objects, free space and flags still apply; --lift appends new
+splats after them), inferred.bin with 3 on every splat the completion changed
+or added, and complete.json with the numbers.
 Run with the reconstruction environment; then trust_map.py --scene <out>.
 
   python scene_bake.py --scene courtyard-objects --out courtyard-complete
@@ -58,6 +59,13 @@ def main():
     ap.add_argument("--scale", type=float, default=0.5, help="training resolution of the recorded frames")
     ap.add_argument("--changed", type=float, default=0.04, help="flag splats whose colour moved more than this")
     ap.add_argument("--skip-paths", nargs="*", default=[], help="generated paths to leave out (e.g. p03 p04)")
+    ap.add_argument("--paths", nargs="*", help="only these generated paths (default: all but --skip-paths)")
+    ap.add_argument("--lift", nargs="*", default=[],
+                    help="lift these paths' never-recorded pixels into new splats first (MoGe-2 depth aligned to the "
+                         "scene where the frame shows recorded surfaces), so the fit has room for their detail")
+    ap.add_argument("--lift-every", type=int, default=4, help="lift every Nth frame of a path")
+    ap.add_argument("--lift-stride", type=int, default=4, help="new splats from every Nth pixel")
+    ap.add_argument("--max-new", type=int, default=400000)
     args = ap.parse_args()
     torch.manual_seed(0)
     random.seed(0)
@@ -118,7 +126,7 @@ def main():
     # generated paths
     novel, paths = [], []
     for d in sorted((work / "complete").glob("p[0-9][0-9]")):
-        if not (d / "gen").exists() or d.name in args.skip_paths:
+        if not (d / "gen").exists() or d.name in args.skip_paths or (args.paths and d.name not in args.paths):
             continue
         cams = json.loads((d / "cameras.json").read_text())
         K = torch.tensor(cams["K"], dtype=torch.float32, device="cuda")
@@ -148,6 +156,69 @@ def main():
         raise SystemExit("no generated frames to fit: run scene_generate.py first")
     print(f"{len(recorded)} recorded frames, {len(novel)} generated frames from {len(paths)} paths; "
           f"{int(frozen.sum())} of {n} splats frozen as recorded", flush=True)
+
+    # new splats for what the lifted paths show where nothing was recorded
+    n_new = 0
+    if args.lift:
+        sys.path.insert(0, str(REPO / "tools" / "MoGe"))
+        from moge.model.v2 import MoGeModel
+        moge = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").cuda().eval()
+        pts_all, rgb_all, size_all, used = [], [], [], 0
+        for v in novel:
+            if v["path"] not in args.lift or v["frame"] % args.lift_every:
+                continue
+            img, K, W_, H_ = v["gt"].cuda().float() / 255, v["K"], v["W"], v["H"]
+            with torch.no_grad():
+                m = moge.infer(img.permute(2, 0, 1), fov_x=math.degrees(2 * math.atan(W_ / (2 * float(K[0, 0])))))
+                out_d, a_d, _ = rasterization(
+                    params["means"], F.normalize(params["quats"], dim=1), torch.exp(params["scales"]),
+                    torch.sigmoid(params["opacities"]), torch.cat([params["sh0"], params["shN"]], 1),
+                    torch.linalg.inv(v["c2w"])[None], K[None], W_, H_, sh_degree=3, rasterize_mode=mode,
+                    render_mode="RGB+ED")
+            depth_r, alpha = out_d[0, ..., 3], a_d[0, ..., 0]
+            dm = m["depth"]
+            valid = m["mask"].bool() & torch.isfinite(dm) & (dm > 0)
+            teach = v["teach"].cuda()
+            known = ~teach & (alpha > 0.95) & valid & (depth_r > 0)
+            if known.sum() < 500:
+                continue  # no recorded surface in view to put the depth to scale
+            scale = float(torch.median(depth_r[known] / dm[known]))
+            grid = torch.zeros_like(teach)
+            grid[::args.lift_stride, ::args.lift_stride] = True
+            ys, xs = torch.nonzero(teach & valid & grid, as_tuple=True)
+            if not len(ys):
+                continue
+            z = dm[ys, xs] * scale
+            rays = torch.stack([(xs + 0.5 - K[0, 2]) / K[0, 0], (ys + 0.5 - K[1, 2]) / K[1, 1], torch.ones_like(z)], 1)
+            pts_all.append((rays * z[:, None]) @ v["c2w"][:3, :3].T + v["c2w"][:3, 3])
+            rgb_all.append(img[ys, xs])
+            size_all.append(z / K[0, 0] * args.lift_stride * 0.6)
+            used += 1
+        del moge
+        torch.cuda.empty_cache()
+        if pts_all:
+            pts, rgb, size = torch.cat(pts_all), torch.cat(rgb_all), torch.cat(size_all)
+            q = torch.floor(pts / (size.median() * 0.5)).long()  # overlapping frames see the same surface: merge
+            _, inv = torch.unique(q, dim=0, return_inverse=True)
+            k = int(inv.max()) + 1
+            cnt = torch.zeros(k, device="cuda").index_add_(0, inv, torch.ones(len(inv), device="cuda"))
+            pts = torch.zeros(k, 3, device="cuda").index_add_(0, inv, pts) / cnt[:, None]
+            rgb = torch.zeros(k, 3, device="cuda").index_add_(0, inv, rgb) / cnt[:, None]
+            size = torch.zeros(k, device="cuda").index_add_(0, inv, size) / cnt
+            if k > args.max_new:
+                keep = torch.randperm(k, device="cuda")[:args.max_new]
+                pts, rgb, size, k = pts[keep], rgb[keep], size[keep], args.max_new
+            added = {"means": pts, "quats": torch.tensor([[1.0, 0, 0, 0]], device="cuda").repeat(k, 1),
+                     "scales": torch.log(size.clamp(min=1e-6))[:, None].repeat(1, 3),
+                     "opacities": torch.full((k,), math.log(0.7 / 0.3), device="cuda"),
+                     "sh0": ((rgb - 0.5) / SH_C0)[:, None],
+                     "shN": torch.zeros((k,) + params["shN"].shape[1:], device="cuda")}
+            params = {kk: torch.nn.Parameter(torch.cat([params[kk].detach(), added[kk]]).contiguous()) for kk in params}
+            sh0_before = torch.cat([sh0_before, added["sh0"]])
+            frozen = torch.cat([frozen, torch.zeros(k, dtype=torch.bool, device="cuda")])
+            flags = np.r_[flags, np.full(k, 3, np.uint8)]
+            n_new = k
+        print(f"lifted {used} frames of {', '.join(args.lift)} into {n_new} new splats", flush=True)
 
     delta = torch.nn.Parameter(torch.zeros(len(novel), 6, device="cuda"))
     scene_scale = parser.scene_scale * 1.1
@@ -228,20 +299,26 @@ def main():
     if out.exists():
         shutil.rmtree(out)
     shutil.copytree(src, out, ignore=shutil.ignore_patterns("scene.ply", "inferred.bin", "trust.bin", "trust.json", "coverage.splat"))
+    if n_new and (src / "objects.bin").exists():  # new splats belong to no object
+        ids = np.frombuffer((src / "objects.bin").read_bytes(), "<u2")
+        (out / "objects.bin").write_bytes(np.r_[ids, np.zeros(n_new, np.uint16)].astype("<u2").tobytes())
     p = {k: v.detach() for k, v in params.items()}
+    n_all = n + n_new
     changed = ((SH_C0 * (p["sh0"] - sh0_before)).abs().amax((1, 2)) > args.changed).cpu().numpy() & ~frozen.cpu().numpy()
     flags[changed] = 3
     ply_out = {"x": p["means"][:, 0], "y": p["means"][:, 1], "z": p["means"][:, 2]}
     ply_out.update({f"f_dc_{i}": p["sh0"][:, 0, i] for i in range(3)})
-    shn = p["shN"].transpose(1, 2).reshape(n, -1)
+    shn = p["shN"].transpose(1, 2).reshape(n_all, -1)
     ply_out.update({f"f_rest_{i}": shn[:, i] for i in range(shn.shape[1])})
     ply_out["opacity"] = p["opacities"]
     ply_out.update({f"scale_{i}": p["scales"][:, i] for i in range(3)})
     ply_out.update({f"rot_{i}": p["quats"][:, i] for i in range(4)})
     names = list(ply)  # keep the source's column order
-    write_ply(out / "scene.ply", {k: ply_out[k].cpu().numpy() if k in ply_out else ply[k] for k in names})
+    write_ply(out / "scene.ply", {k: ply_out[k].cpu().numpy() if k in ply_out else np.r_[ply[k], np.zeros(n_new, np.float32)]
+                                  for k in names})
     (out / "inferred.bin").write_bytes(flags.tobytes())
     meta.pop("coverage", None)
+    meta["splatCount"] = int(n_all)
     meta["inferred"] = {**meta.get("inferred", {}), "file": "inferred.bin", "count": int((flags > 0).sum()),
                         "values": {"1": "estimated for what the recording never saw (infer pass)",
                                    "2": "grown by an object rebuild for sides of it the recording never saw",
@@ -252,7 +329,8 @@ def main():
                                        f"recorded splats frozen; {int(changed.sum())} splats changed, flagged 3")
     (out / "scene.json").write_text(json.dumps(meta, indent=1))
     report = {"scene": args.scene, "out": args.out, "paths": paths, "generatedFrames": len(novel),
-              "frozenSplats": int(frozen.sum()), "changedSplats": int(changed.sum()), "steps": args.steps,
+              "frozenSplats": int(frozen.sum()), "changedSplats": int(changed.sum()), "newSplats": n_new,
+              "lifted": args.lift, "steps": args.steps,
               "before": before, "after": after, "minutes": round(minutes, 1),
               "cameraCorrectionMaxDeg": round(float(delta[:, :3].norm(dim=1).max() * 0.1 * 180 / math.pi), 2)}
     (out / "complete.json").write_text(json.dumps(report, indent=1))

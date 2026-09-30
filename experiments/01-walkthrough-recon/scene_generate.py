@@ -58,6 +58,11 @@ def main():
                     help="the scene's own render at the end of the turn as a soft keyframe (0 = none): keeps the "
                          "layout the reconstruction and infer pass already have")
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--scene-keys", type=int, nargs="*", default=[],
+                    help="more soft keyframes from the scene's own render at these frames (multiples of 8), e.g. "
+                         "32 64: later paths then follow what earlier paths completed")
+    ap.add_argument("--scene-key-strength", type=float, default=0.25)
+    ap.add_argument("--force", action="store_true", help="generate again even if the path has a video")
     args = ap.parse_args()
 
     root = HERE / "work" / args.work / "complete"
@@ -65,7 +70,7 @@ def main():
     if not comfy_client.ready():
         raise SystemExit("ComfyUI isn't running on " + comfy_client.COMFY)
     for d in dirs:
-        if (d / "path.mp4").exists():
+        if (d / "path.mp4").exists() and not args.force:
             print(f"{d.name}: already generated")
             continue
         cams = json.loads((d / "cameras.json").read_text())
@@ -77,8 +82,10 @@ def main():
         caption = (d / "caption.txt").read_text().strip() if (d / "caption.txt").exists() else ""
         prompt = prompt_for(cams, caption)
         end = (frames - 1) // 8 * 8
-        keyframes = ([(comfy_client.upload(str(d / "render" / f"{end:04d}.jpg")), end, args.end_strength)]
-                     if args.end_strength > 0 else [])
+        keyframes = [(comfy_client.upload(str(d / "render" / f"{k:04d}.jpg")), k, args.scene_key_strength)
+                     for k in args.scene_keys if 0 < k < end]
+        if args.end_strength > 0:
+            keyframes.append((comfy_client.upload(str(d / "render" / f"{end:04d}.jpg")), end, args.end_strength))
         graph = comfy_client.ltx_depth_graph(prompt, NEGATIVE, comfy_client.upload(str(guide)),
                                              comfy_client.upload(str(d / "first.png")), frames, W, H, fps,
                                              f"braindance_{args.work}_{d.name}_{int(time.time())}",
@@ -100,6 +107,7 @@ def main():
         sheet.save(d / "sheet.jpg", quality=88)
         (d / "generate.json").write_text(json.dumps({"prompt": prompt, "negative": NEGATIVE, "guideStrength": args.guide_strength,
                                                      "endKeyframe": {"frame": end, "strength": args.end_strength},
+                                                     "sceneKeyframes": {"frames": args.scene_keys, "strength": args.scene_key_strength},
                                                      "blur": args.blur, "seed": args.seed,
                                                      "seconds": round(time.time() - t0)}, indent=1))
         print(f"{d.name}: {len(images)} frames in {time.time() - t0:.0f}s (sheet: generated / scene / guide)", flush=True)

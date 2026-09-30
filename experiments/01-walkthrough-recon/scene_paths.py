@@ -64,6 +64,9 @@ def main():
     ap.add_argument("--walk", type=float, default=1.4, help="walk mode: how far, x median surface distance")
     ap.add_argument("--first", type=int, help="number the new paths from pNN (default: 0 for turn, 10 for walk); "
                                               "existing paths are kept")
+    ap.add_argument("--rerender", nargs="+", metavar="pNN",
+                    help="don't plan: render these existing paths' guides again from --scene (depth, what was "
+                         "recorded, the scene as it is now), so each path follows what earlier ones completed")
     args = ap.parse_args()
     first = args.first if args.first is not None else (0 if args.mode == "turn" else 10)
 
@@ -97,6 +100,41 @@ def main():
                                                 near_plane=near_plane, rasterize_mode=scene.mode, render_mode="RGB+ED")
         alpha = alpha[0, ..., 0]
         return (out_img[0, ..., 0] / alpha.clamp(min=1e-4)).clamp(0, 1), out_img[0, ..., 1], alpha
+
+    def write_guides(d, path, K):
+        """depth/, teach/ and render/ along a path, from the scene as it is. Returns (never-recorded share
+        per frame, depth near, depth far)."""
+        for sub in ("depth", "teach", "render"):
+            (d / sub).mkdir(parents=True, exist_ok=True)
+        depths, teach = [], []
+        for i, m in enumerate(path):
+            with torch.no_grad():
+                img, _, _ = scene.render(torch.tensor(m, dtype=torch.float32, device="cuda"), K, W, H)
+            recorded, depth, alpha = guide(m, K, W, H)
+            depths.append((depth.cpu().numpy(), alpha.cpu().numpy()))
+            never = ((1 - recorded) * alpha + (1 - alpha)).clamp(0, 1)
+            Image.fromarray((never.cpu().numpy() * 255).astype(np.uint8)).save(d / "teach" / f"{i:04d}.png")
+            Image.fromarray((img.clamp(0, 1) * 255).byte().cpu().numpy()).save(d / "render" / f"{i:04d}.jpg", quality=90)
+            teach.append(float(never.mean()))
+        valid = np.concatenate([dd[a > 0.5] for dd, a in depths])
+        near, far = np.percentile(valid, 2), np.percentile(valid, 98) * 1.1
+        for i, (dd, a) in enumerate(depths):
+            v = 1 - (np.log(np.clip(dd, near, far)) - math.log(near)) / (math.log(far) - math.log(near))
+            v = np.where(a > 0.5, v, 0.0)
+            Image.fromarray((v * 255).astype(np.uint8)).save(d / "depth" / f"{i:04d}.png")
+        return teach, float(near), float(far)
+
+    if args.rerender:
+        for name in args.rerender:
+            d = out / name
+            cams = json.loads((d / "cameras.json").read_text())
+            K = torch.tensor(cams["K"], dtype=torch.float32, device="cuda")
+            teach, near, far = write_guides(d, [np.asarray(m) for m in cams["c2w"]], K)
+            cams.update(scene=args.scene, neverRecordedShare=[round(x, 3) for x in teach],
+                        depthEncoding={"near": near, "far": far, "code": "1 - log-normalised depth, far clamped; 0 = empty"})
+            (d / "cameras.json").write_text(json.dumps(cams, indent=1))
+            print(f"{name}: guides rendered again from {args.scene}; never recorded {np.mean(teach):.0%}", flush=True)
+        return
 
     def heading(c2w0):
         h = c2w0[:3, 2] - c2w0[:3, 2] @ up * up
@@ -182,8 +220,6 @@ def main():
 
     for n, (_, f, deg, unrecorded, cover) in enumerate(plans):
         d = out / f"p{first + n:02d}"
-        for sub in ("depth", "teach", "render"):
-            (d / sub).mkdir(parents=True, exist_ok=True)
         c2w0 = np.asarray(f["c2w"], np.float64)
         K, s, crop = intrinsics(f, W, H)
         if args.mode == "turn":
@@ -194,22 +230,7 @@ def main():
         else:
             reach = walk_reach(c2w0)
         path = build(c2w0, deg, reach)
-        depths, teach = [], []
-        for i, m in enumerate(path):
-            with torch.no_grad():
-                img, _, _ = scene.render(torch.tensor(m, dtype=torch.float32, device="cuda"), K, W, H)
-            recorded, depth, alpha = guide(m, K, W, H)
-            depths.append((depth.cpu().numpy(), alpha.cpu().numpy()))
-            never = ((1 - recorded) * alpha + (1 - alpha)).clamp(0, 1)
-            Image.fromarray((never.cpu().numpy() * 255).astype(np.uint8)).save(d / "teach" / f"{i:04d}.png")
-            Image.fromarray((img.clamp(0, 1) * 255).byte().cpu().numpy()).save(d / "render" / f"{i:04d}.jpg", quality=90)
-            teach.append(float(never.mean()))
-        valid = np.concatenate([dd[a > 0.5] for dd, a in depths])
-        near, far = np.percentile(valid, 2), np.percentile(valid, 98) * 1.1
-        for i, (dd, a) in enumerate(depths):
-            v = 1 - (np.log(np.clip(dd, near, far)) - math.log(near)) / (math.log(far) - math.log(near))
-            v = np.where(a > 0.5, v, 0.0)
-            Image.fromarray((v * 255).astype(np.uint8)).save(d / "depth" / f"{i:04d}.png")
+        teach, near, far = write_guides(d, path, K)
         src = work / "train" / "images" / f["name"]  # undistorted, like the renders
         image = Image.open(src if src.exists() else work / "images" / f["name"]).convert("RGB")
         image = image.resize((round(image.width * s), H), Image.LANCZOS)
