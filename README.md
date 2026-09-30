@@ -29,20 +29,20 @@ Braindance Studio rebuilds a phone-style walkthrough video as a 3D Gaussian-spla
 ## How it works
 
 ```mermaid
-flowchart LR
-  V[Walkthrough video] --> PF[Pre-flight check]
-  PF --> SOLVE[Camera solve<br/>COLMAP]
-  SOLVE --> TRAIN[Splat training<br/>gsplat]
-  TRAIN --> FILL[Free space +<br/>fill passes<br/>Difix3D+]
-  FILL --> INFER[Infer pass<br/>SEVA + MoGe-2]
-  INFER --> OBJ[Objects<br/>Qwen3.5 · imajev · SAM 3.1]
-  OBJ --> REB[Rebuild objects whole<br/>LTX-2.3 + depth]
-  REB --> COMP[Complete unseen views<br/>LTX-2.3 along scene depth]
-  COMP --> REF[Geometry refine<br/>MoGe-2 depth + normals]
-  REF --> WALK[Walk completion<br/>one path at a time]
-  WALK --> VIEW[Viewer<br/>gsplat worker · Spark]
-  OBJ -.-> SIM[MuJoCo / OpenUSD]
-  TRUST[Trust map] -.-> VIEW
+flowchart TB
+  subgraph R["1 · Reconstruct"]
+    direction LR
+    V[Walkthrough video] --> PF[Pre-flight check] --> SOLVE[Camera solve<br/>COLMAP] --> TRAIN[Splat training<br/>gsplat] --> FILL[Free space and<br/>fill passes, Difix3D+]
+  end
+  subgraph U["2 · Understand"]
+    direction LR
+    INFER[Infer pass<br/>SEVA + MoGe-2] --> OBJ[Objects<br/>Qwen3.5, imajev, SAM 3.1] --> TRUST[Trust map<br/>per splat] --> SCALE[Metric scale<br/>MoGe-2] --> SIM[MuJoCo and<br/>OpenUSD export]
+  end
+  subgraph C["3 · Complete and view"]
+    direction LR
+    REB[Rebuild objects<br/>LTX-2.3 + depth] --> COMP[Complete unseen views<br/>LTX-2.3 on scene depth] --> REF[Geometry refine<br/>MoGe-2 depth, normals] --> WALK[Walk paths<br/>one at a time] --> VIEW[Viewer<br/>gsplat worker, Spark]
+  end
+  R --> U --> C
 ```
 
 Every stage writes its own viewer package (`viewer/<scene>-<stage>/`), so you can open and compare any stage. Four ideas hold it together:
