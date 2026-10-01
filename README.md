@@ -60,18 +60,30 @@ The full research log, with every number, failure and fix, is in [`experiments/0
 
 ## Install
 
-Windows 10/11 with an NVIDIA GPU (built on an RTX 4090 with 24 GB, 64 GB RAM). You need Python 3.10 and 3.11, [uv](https://docs.astral.sh/uv/) and git. Disk: about 70 GB for all the models, plus tens of GB of working files per scene. macOS and Linux are untested.
+Windows 10/11 with an NVIDIA GPU (built on an RTX 4090 with 24 GB, 64 GB RAM). You need [git](https://git-scm.com) (which includes Git Bash), [uv](https://docs.astral.sh/uv/), and Visual Studio Build Tools with a CUDA 12 toolkit (to compile one package). macOS and Linux are untested.
 
-The steps are in **[docs/INSTALL.md](docs/INSTALL.md)**:
-- **Core, needed for everything:** the reconstruction environment (PyTorch 2.4 + gsplat 1.5.3), COLMAP 4.2 and the gsplat sources. This is enough to reconstruct a video and view it.
-- **Optional, per feature:** SAM 3.1 for objects, SEVA + Qwen3.5 + imajev for the infer pass, captions and object attributes, and ComfyUI + LTX-2.3 for rebuilding objects and completing unseen views. Difix and MoGe-2 are used by several stages.
+In Git Bash, from the repo root:
+
+```bash
+./install.sh                      # core: reconstruct a walkthrough video and view it (~6 GB of models)
+./install.sh --all                # + objects (SAM 3/3.1) and the infer pass, captions, attributes (SEVA, Qwen3.5, imajev)
+./install.sh --comfyui D:/ComfyUI # + LTX-2.3 for that ComfyUI: object rebuilds, completing unseen views (43 GB)
+./install.sh --check              # what's installed and working
+```
+
+What it does:
+- **Before downloading:** it lists every download with its size and asks first.
+- **Reuse:** it copies models already in your Hugging Face cache instead of downloading them again.
+- **Safe to rerun:** finished steps are skipped, and an environment that already works is left alone.
+
+Some models are gated (SAM 3, Stable Virtual Camera): accept their terms on Hugging Face and run `hf auth login` first. What each step does, and how to do it by hand, is in **[docs/INSTALL.md](docs/INSTALL.md)**.
 
 ## Quick start
 
 View a scene you've built (two terminals, from the repo root):
 
 ```bash
-python experiments/01-walkthrough-recon/viewer/serve.py 8790
+.venv-recon/Scripts/python.exe experiments/01-walkthrough-recon/viewer/serve.py 8790
 ```
 
 ```bash
