@@ -42,7 +42,7 @@ def main():
     venv = lambda name: REPO / name / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     recon = venv(".venv-recon")
     env = {k: v for k, v in os.environ.items() if k not in ("__PYVENV_LAUNCHER__", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}
-    env.update(PYTHONWARNINGS="ignore", PYTHONUNBUFFERED="1", HF_HOME=str(REPO / "tools" / "hf"))
+    env.update(PYTHONWARNINGS="ignore", PYTHONUNBUFFERED="1", HF_HOME=os.environ.get("HF_HOME", str(REPO / "tools" / "hf")))
     run = lambda *cmd: subprocess.run([str(c) for c in cmd], cwd=HERE, env=env, check=True)
     root = HERE / "work" / work_name / "complete"
 

@@ -28,6 +28,7 @@ Run with the reconstruction environment.
 import argparse
 import json
 import math
+import os
 import random
 import shutil
 import sys
@@ -42,6 +43,7 @@ from PIL import Image
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+os.environ.setdefault("HF_HOME", str(REPO / "tools" / "hf"))  # the repo's model cache (install.sh fills it)
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(REPO / "tools" / "gsplat-src" / "examples"))
 sys.path.insert(0, str(REPO / "tools" / "MoGe"))

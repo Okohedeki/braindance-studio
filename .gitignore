@@ -10,3 +10,6 @@ experiments/*/data/
 experiments/*/work/
 experiments/*/viewer/*/
 experiments/*/sim/
+
+# Installer log
+install.log

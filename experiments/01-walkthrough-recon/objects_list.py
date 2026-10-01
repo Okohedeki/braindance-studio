@@ -14,6 +14,7 @@ Writes work/<work>/objects/identify/candidates.json. Run with .venv-seva.
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -29,6 +30,7 @@ from PIL import Image  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+os.environ.setdefault("HF_HOME", str(REPO / "tools" / "hf"))  # the repo's model cache (install.sh fills it)
 BUNDLE = REPO / "tools" / "imajev" / "artifacts" / "model-qwen4b.json"
 
 PROMPT = ("List every distinct kind of physical object you can see in this photo: furniture, fixtures, appliances, "

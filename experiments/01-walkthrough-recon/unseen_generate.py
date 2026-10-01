@@ -15,6 +15,7 @@ Run with the SEVA environment (.venv-seva):
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+os.environ.setdefault("HF_HOME", str(REPO / "tools" / "hf"))  # the repo's model cache (install.sh fills it)
 sys.path.insert(0, str(REPO / "tools" / "stable-virtual-camera"))
 from seva.eval import run_one_scene  # noqa: E402
 from seva.model import SGMWrapper  # noqa: E402

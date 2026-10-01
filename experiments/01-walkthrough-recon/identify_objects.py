@@ -41,7 +41,7 @@ from PIL import Image
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 IMAJEV = REPO / "tools" / "imajev"
-HF_HOME = REPO / "tools" / "hf"
+HF_HOME = Path(os.environ.get("HF_HOME", REPO / "tools" / "hf"))
 
 MATERIALS = {"wood": "wood or wood veneer", "metal": "metal", "glass": "glass or mirror",
              "fabric": "fabric, upholstery or rope", "leather": "leather or faux leather",
