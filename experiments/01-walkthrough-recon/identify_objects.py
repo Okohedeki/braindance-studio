@@ -121,6 +121,7 @@ class Imajev:
                 break
             except OSError:
                 if time.time() - t0 > 900:
+                    self.close()
                     raise SystemExit("imajev server didn't come up in 15 min")
                 time.sleep(3)
 
@@ -140,7 +141,10 @@ class Imajev:
         return out.get("answers", out)
 
     def close(self):
-        self.proc.terminate()
+        if os.name == "nt":  # a venv's python.exe is a launcher: the server, with the model loaded, is its child
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(self.proc.pid)], capture_output=True)
+        else:
+            self.proc.terminate()
         try:
             self.proc.wait(30)
         except subprocess.TimeoutExpired:
