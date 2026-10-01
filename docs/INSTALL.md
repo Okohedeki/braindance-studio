@@ -24,11 +24,12 @@ The rest of this guide is what the script does, step by step, for doing it by ha
 - **Runs:** SAM 3 found chairs on a frame and SAM 3.1 tracked them over 40 frames; SEVA loaded; Qwen3.5-4B captioned a frame; imajev answered a question.
 - **Core pipeline (earlier manual test of the same steps):** the kitchen clip rebuilt from scratch, all 235 of 235 frames solved and held-out PSNR 36.2 dB (the original run's 36 dB); the viewer ran in GPU mode at about 53 fps; the worker self-test passed.
 
-The installer test found and fixed four problems:
+The installer test found and fixed five problems:
 - **Missing packages:** SAM 3 needs `pycocotools` and `psutil` without declaring them.
 - **Gated models:** they failed to load from the repo's cache because the Hugging Face login wasn't found there (now `hf_cache.py`).
 - **Leftover imajev servers:** `identify_objects.py` left them running with the model on the GPU (Windows venv launchers).
 - **Driver check:** it misread the CUDA version from newer drivers' `nvidia-smi`.
+- **Cache copies:** copying a Hugging Face cache with `cp` could silently drop its Windows links, leaving the weights unfindable. It now copies each snapshot file as a real file, and checks that the result loads.
 
 What the test didn't cover:
 - **Model downloads:** models were copied from an existing install rather than downloaded.

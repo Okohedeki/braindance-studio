@@ -86,7 +86,10 @@ import sys; sys.modules.setdefault('mistral_common', None); sys.path.insert(0, '
 import torch, transformers, fastapi, uvicorn, peft, multipart, utils3d_moge
 import seva.eval, seva.model, seva.sampling, seva.modules.autoencoder, seva.modules.conditioner
 assert torch.cuda.is_available()" >/dev/null 2>&1; }
-in_cache() { [ -d "$HF_HOME/hub/models--${1//\//--}/snapshots" ] && [ -n "$(ls -A "$HF_HOME/hub/models--${1//\//--}/snapshots" 2>/dev/null)" ]; }
+in_cache() {  # a snapshot with at least one readable file larger than 1 MB (not just an empty folder)
+  local snaps="$HF_HOME/hub/models--${1//\//--}/snapshots"
+  [ -d "$snaps" ] && [ -n "$(find -L "$snaps" -mindepth 2 -type f -size +1M 2>/dev/null | head -1)" ]
+}
 qwen_ready() { "$PY_RECON" -c "
 import json, pathlib, sys
 p = pathlib.Path(json.load(open('tools/imajev/artifacts/model-qwen4b.json'))['path'])
@@ -245,7 +248,17 @@ plan() { PLAN+=("$1|$2|$3"); }
 copy_cached() {  # repo: copy from --models-from or the default Hugging Face cache instead of downloading
   local name="models--${1//\//--}" src
   for src in ${MODELS_FROM:+"$MODELS_FROM/hf/hub/$name"} "$DEFAULT_HF/hub/$name"; do
-    if [ -d "$src/snapshots" ]; then mkdir -p "$HF_HOME/hub"; cp -r "$src" "$HF_HOME/hub/"; return 0; fi
+    [ -d "$src/snapshots" ] || continue
+    # The snapshots are usually links into blobs/, which cp doesn't reproduce reliably on Windows: copy each
+    # snapshot file as a real file instead (a layout Hugging Face reads too), and skip blobs/.
+    "$PY_RECON" - "$src" "$HF_HOME/hub/$name" <<'EOF' && in_cache "$1" && return 0
+import shutil, sys
+from pathlib import Path
+src, dst = Path(sys.argv[1]), Path(sys.argv[2])
+for part in ("refs", "snapshots"):
+    if (src / part).is_dir():
+        shutil.copytree(src / part, dst / part, symlinks=False, dirs_exist_ok=True)
+EOF
   done
   return 1
 }
