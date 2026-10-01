@@ -212,7 +212,7 @@ if [ "$OBJECTS" = 1 ]; then
   clone sam3 https://github.com/facebookresearch/sam3.git 2345a4a
   if check_sam3; then skip "already installed and working"; else
     uv_311_env .venv-sam3
-    uv pip install --python "$PY_SAM3" -e tools/sam3 triton-windows "setuptools<81" opencv-python safetensors einops
+    uv pip install --python "$PY_SAM3" -e tools/sam3 triton-windows "setuptools<81" opencv-python safetensors einops \n      pycocotools psutil  # imported by sam3 but not declared
     check_sam3 || die "the objects environment fails its import check; see install.log"
     ok "objects environment"
   fi
