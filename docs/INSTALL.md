@@ -24,10 +24,16 @@ The rest of this guide is what the script does, step by step, for doing it by ha
 - **Runs:** SAM 3 found chairs on a frame and SAM 3.1 tracked them over 40 frames; SEVA loaded; Qwen3.5-4B captioned a frame; imajev answered a question.
 - **Core pipeline (earlier manual test of the same steps):** the kitchen clip rebuilt from scratch, all 235 of 235 frames solved and held-out PSNR 36.2 dB (the original run's 36 dB); the viewer ran in GPU mode at about 53 fps; the worker self-test passed.
 
+The installer test found and fixed four problems:
+- **Missing packages:** SAM 3 needs `pycocotools` and `psutil` without declaring them.
+- **Gated models:** they failed to load from the repo's cache because the Hugging Face login wasn't found there (now `hf_cache.py`).
+- **Leftover imajev servers:** `identify_objects.py` left them running with the model on the GPU (Windows venv launchers).
+- **Driver check:** it misread the CUDA version from newer drivers' `nvidia-smi`.
+
 What the test didn't cover:
 - **Model downloads:** models were copied from an existing install rather than downloaded.
 - **System-wide prerequisites:** the NVIDIA driver, Visual Studio and the CUDA toolkit were already on the machine.
-- **`--comfyui`:** ComfyUI was already set up, so this step only detected the existing nodes and models.
+- **`--comfyui`:** ComfyUI was already set up, so this step only detected the existing nodes and the three LTX files.
 
 If a step fails for you, please open an issue with the error.
 
@@ -234,7 +240,8 @@ Notes on these steps:
 ## Troubleshooting
 
 - **"401" or "gated" from Hugging Face.** Accept the model's terms on its page (SAM 3 access is approved by hand), run `hf auth login`, then run the installer again. Gated models are checked online even when cached; the scripts find the login saved by `hf auth login` themselves (`hf_cache.py`).
-- **`$'': command not found` when running `install.sh`.** The file was checked out with Windows line endings. `.gitattributes` prevents that for new clones; for an old one, run `git checkout -- install.sh` after pulling.
+- **`$'
+': command not found` when running `install.sh`.** The file was checked out with Windows line endings. `.gitattributes` prevents that for new clones; for an old one, run `git checkout -- install.sh` after pulling.
 - **The camera solve breaks into pieces.** `reconstruct.py` retries with ALIKED + LightGlue when SIFT joins under 90% of frames. Those run on ONNX Runtime's CUDA provider, which needs cuDNN 9; the script puts PyTorch's `torch/lib` on the path for it.
 - **Out of GPU memory.** Pass `--wait-for-gpu` to the importer. Don't run the render worker, ComfyUI generation and training at once.
 - **The viewer says "browser" instead of "GPU".** The worker isn't running, or it was started with an `--allow-origin` that doesn't match the page's address.
