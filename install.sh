@@ -25,6 +25,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO"
 EXP=experiments/01-walkthrough-recon
 exec > >(tee -a "$REPO/install.log") 2>&1
+trap 'printf "\n\033[31merror:\033[0m the step at install.sh line %s failed (see the output above and install.log)\n" "$LINENO"' ERR
 
 # Pinned versions (what the project was built and tested with)
 TORCH_RECON="torch==2.4.1 torchvision==0.19.1"; TORCH_RECON_INDEX=https://download.pytorch.org/whl/cu124
@@ -212,7 +213,9 @@ if [ "$OBJECTS" = 1 ]; then
   clone sam3 https://github.com/facebookresearch/sam3.git 2345a4a
   if check_sam3; then skip "already installed and working"; else
     uv_311_env .venv-sam3
-    uv pip install --python "$PY_SAM3" -e tools/sam3 triton-windows "setuptools<81" opencv-python safetensors einops \n      pycocotools psutil  # imported by sam3 but not declared
+    # pycocotools and psutil: imported by sam3 but not declared
+    uv pip install --python "$PY_SAM3" -e tools/sam3 triton-windows "setuptools<81" opencv-python safetensors einops \
+      pycocotools psutil
     check_sam3 || die "the objects environment fails its import check; see install.log"
     ok "objects environment"
   fi
