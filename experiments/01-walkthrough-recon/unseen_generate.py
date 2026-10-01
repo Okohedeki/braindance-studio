@@ -15,7 +15,6 @@ Run with the SEVA environment (.venv-seva):
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -25,7 +24,8 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-os.environ.setdefault("HF_HOME", str(REPO / "tools" / "hf"))  # the repo's model cache (install.sh fills it)
+from hf_cache import use_repo_cache  # noqa: E402
+use_repo_cache(REPO)  # models in tools/hf, keeping the user's Hugging Face login
 sys.path.insert(0, str(REPO / "tools" / "stable-virtual-camera"))
 from seva.eval import run_one_scene  # noqa: E402
 from seva.model import SGMWrapper  # noqa: E402

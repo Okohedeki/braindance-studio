@@ -25,7 +25,6 @@ Run with the reconstruction environment.
 import argparse
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -39,7 +38,8 @@ from PIL import Image
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-os.environ.setdefault("HF_HOME", str(REPO / "tools" / "hf"))  # the repo's model cache (install.sh fills it)
+from hf_cache import use_repo_cache  # noqa: E402
+use_repo_cache(REPO)  # models in tools/hf, keeping the user's Hugging Face login
 sys.path.insert(0, str(REPO / "tools" / "gsplat-src" / "examples"))
 sys.path.insert(0, str(REPO / "tools" / "MoGe"))
 from datasets.colmap import Parser  # noqa: E402

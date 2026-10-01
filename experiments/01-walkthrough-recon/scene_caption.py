@@ -13,7 +13,6 @@ Writes caption.txt in each path folder. Run with .venv-seva.
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -25,7 +24,8 @@ import torch  # noqa: E402
 from PIL import Image  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-os.environ.setdefault("HF_HOME", str(HERE.parents[1] / "tools" / "hf"))  # the repo's model cache (install.sh fills it)
+from hf_cache import use_repo_cache  # noqa: E402
+use_repo_cache(HERE.parents[1])  # models in tools/hf, keeping the user's Hugging Face login
 BUNDLE = HERE.parents[1] / "tools" / "imajev" / "artifacts" / "model-qwen4b.json"
 PROMPT = ("Describe the place in this photo in one sentence for a video generator: say whether it is indoors or "
           "outdoors, the kind of place, the architecture, materials, colours and light, and what surrounds the "
