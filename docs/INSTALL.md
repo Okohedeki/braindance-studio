@@ -1,6 +1,26 @@
 # Install
 
-These steps rebuild the environments the project was developed with on Windows 10, with an RTX 4090 (24 GB), 62 GB of RAM and 16 cores. They haven't been re-run end to end on a clean machine, so if a step fails, please open an issue with the error.
+These steps rebuild the environments the project was developed with on Windows 10, with an RTX 4090 (24 GB), 62 GB of RAM and 16 cores.
+
+**Clean-install test (2026-09-30).** A fresh clone in a new folder, with every environment and tool checkout created from these steps as written. What passed:
+- **Kitchen clip rebuilt from scratch:** 235 of 235 frames solved, held-out PSNR 36.2 dB (the original run's 36 dB), in about 40 minutes.
+- **Viewer:** showed the kitchen in GPU mode at about 53 fps.
+- **GPU worker self-test:** passed (35.4 dB against the recording, 12 ms round trip).
+- **Objects:** SAM 3 detected chairs, tables and lamps on a frame; SAM 3.1 tracked "chair" through the clip, and 14 chairs were placed in 3D.
+- **Generation and classification:** SEVA loaded; Qwen3.5-4B captioned a frame; imajev answered two questions (0.94 and 0.89).
+
+The test found four problems, fixed above:
+- The patch script crashed before SAM 3 was installed.
+- New setuptools releases break `import sam3`.
+- imajev's `download_model.py` step was missing, so Qwen had no path.
+- Visual Studio 2019 and CUDA 12.6 also work; the earlier text named only 2022 and 12.4.
+
+What it didn't cover:
+- **Model weights** were copied from the existing install rather than downloaded.
+- **System-wide prerequisites** were already on the machine: the driver, Visual Studio, CUDA, and Python 3.11 with PyTorch.
+- **ComfyUI + LTX-2.3** wasn't reinstalled.
+
+If a step fails for you, please open an issue with the error.
 
 There's one core environment and three optional ones. Install only what the stages you want need:
 
@@ -29,8 +49,12 @@ There's one core environment and three optional ones. Install only what the stag
 
 - An NVIDIA driver recent enough for CUDA 12.4 or later.
 - [uv](https://docs.astral.sh/uv/) and git.
-- Python 3.11 from python.org, for the optional environments.
-- Visual Studio 2022 Build Tools (the C++ x64 workload) and the CUDA Toolkit 12.4. These are needed once, to compile `fused-ssim`.
+- Visual Studio 2019 or 2022 Build Tools (the C++ x64 workload) and a CUDA Toolkit 12.x (12.6 tested). These are needed once, to compile `fused-ssim`.
+- For the optional environments: Python 3.11 from python.org, with CUDA PyTorch installed into it. The tested machine has 2.13 + CUDA 13.0:
+
+  ```bash
+  py -3.11 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+  ```
 - A Hugging Face account. Some models are gated (Stable Virtual Camera, SAM 3): accept their terms on the model pages, then sign in with `hf auth login`.
 - Put the Hugging Face cache inside the repo so every script finds the same models. The orchestrating scripts set this themselves; set it for scripts you run directly:
 
@@ -54,7 +78,14 @@ uv pip install --python .venv-recon/Scripts/python.exe "numpy<2" jaxtyping ninja
 uv pip install --python .venv-recon/Scripts/python.exe --no-deps gsplat==1.5.3 --index-url https://docs.gsplat.studio/whl/pt24cu124
 # Difix (fill passes, still-view sharpening) pins these versions:
 uv pip install --python .venv-recon/Scripts/python.exe "diffusers==0.25.1" "transformers==4.38.0" "peft==0.9.0" "huggingface-hub==0.25.1" lpips
-# fused-ssim compiles CUDA code: run inside a "x64 Native Tools Command Prompt for VS 2022" with CUDA_HOME set
+```
+
+`fused-ssim` compiles CUDA code (about a minute), so run it from `cmd` with the compiler and CUDA set up. Adjust the two paths to your Visual Studio edition and CUDA version:
+
+```bat
+call "C:\Program Files (x86)\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set "CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+set DISTUTILS_USE_SDK=1
 uv pip install --python .venv-recon/Scripts/python.exe --no-build-isolation "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim@328dc9836f513d00c4b5bc38fe30478b4435cbb5"
 ```
 
@@ -63,6 +94,7 @@ uv pip install --python .venv-recon/Scripts/python.exe --no-build-isolation "fus
 ```bash
 # COLMAP 4.2.0: unzip colmap-x64-windows-cuda.zip from https://github.com/colmap/colmap/releases into tools/colmap
 git clone --depth 1 --branch v1.5.3 https://github.com/nerfstudio-project/gsplat.git tools/gsplat-src
+# Windows fixes for pycolmap and gsplat. Run it again after steps 2 and 3; it skips tools not installed yet
 .venv-recon/Scripts/python.exe experiments/01-walkthrough-recon/apply_windows_patches.py
 
 # Difix3D+ (repairs rendered views) and its weights
@@ -88,12 +120,13 @@ It checks image quality against gsplat, timing, the origin check and latest-wins
 
 ## 2. Objects: SAM 3.1 (`.venv-sam3`)
 
-The environment reuses a system Python 3.11 that already has CUDA PyTorch (here 2.13 + CUDA 13.0):
+The environment reuses the system Python 3.11 and its CUDA PyTorch (see the prerequisites). SAM 3 still imports `pkg_resources`, which setuptools 81 and later no longer include, so pin setuptools:
 
 ```bash
 py -3.11 -m venv --system-site-packages .venv-sam3
 git clone https://github.com/facebookresearch/sam3.git tools/sam3
-.venv-sam3/Scripts/python.exe -m pip install -e tools/sam3 triton-windows timm ftfy iopath
+.venv-sam3/Scripts/python.exe -m pip install -e tools/sam3 triton-windows timm ftfy iopath "setuptools<81"
+.venv-recon/Scripts/python.exe experiments/01-walkthrough-recon/apply_windows_patches.py   # SAM 3's attention fix
 ```
 
 **Weights:**
@@ -116,16 +149,20 @@ py -3.11 -m venv --system-site-packages .venv-seva
 .venv-seva/Scripts/python.exe -m pip install --no-deps "utils3d_moge @ git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37"
 
 # Stable Virtual Camera. Not pip-installed: the scripts put it on the path.
-# Its weights, stabilityai/stable-virtual-camera, are gated: accept the terms first.
 git clone https://github.com/Stability-AI/stable-virtual-camera.git tools/stable-virtual-camera
+.venv-recon/Scripts/python.exe experiments/01-walkthrough-recon/apply_windows_patches.py   # SEVA's attention and VAE fixes
 
-# imajev (a calibrated classifier on Qwen3.5-4B)
+# imajev (a calibrated classifier on Qwen3.5-4B), its adapter and its base model
 git clone https://github.com/mohit67890/imajev.git tools/imajev
+cd tools/imajev
+hf download mohit67890/imajev-4b --local-dir adapters/imajev-4b
+../../.venv-seva/Scripts/python.exe scripts/download_model.py --model 4b   # Qwen3.5-4B, 8.7 GB, into $HF_HOME
+cd ../..
 ```
 
-- **imajev adapter:** follow [imajev's README](https://github.com/mohit67890/imajev) to fetch `imajev-4b` into `tools/imajev/adapters/imajev-4b/`. It's on Hugging Face as `mohit67890/imajev-4b`.
-- **Qwen3.5-4B:** `Qwen/Qwen3.5-4B` downloads into `tools/hf` on first use.
-- **Versions used:** stable-virtual-camera fe19948, imajev 7a0e6a1.
+- **The Qwen path.** `download_model.py` writes Qwen3.5-4B's path into `tools/imajev/artifacts/model-qwen4b.json`, and the caption and object-list scripts load Qwen from there too. Run it with `HF_HOME` set (see the prerequisites), so that the path is absolute.
+- **SEVA weights.** `stabilityai/stable-virtual-camera` is gated: accept its terms first. It downloads into `$HF_HOME` on first use, together with the Stable Diffusion 2.1 VAE. The patch script points that VAE at the `sd2-community` mirror, because the original repository no longer serves it.
+- **Versions used:** stable-virtual-camera fe19948, imajev 7a0e6a1, sam3 2345a4a.
 
 ## 4. Video generation: ComfyUI + LTX-2.3
 
