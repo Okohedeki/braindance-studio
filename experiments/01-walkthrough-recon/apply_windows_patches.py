@@ -17,8 +17,10 @@
    files (identical checksums), so SEVA is pointed there. Not a Windows issue,
    but a setup fix all the same.
 
-Safe to run more than once. Run it with the reconstruction environment for
-1 (it patches that environment's pycolmap); the rest patch files under tools/.
+Safe to run more than once, and tools that aren't installed yet are skipped:
+run it again after cloning SAM 3 and SEVA. Run it with the reconstruction
+environment for 1 (it patches that environment's pycolmap); the rest patch
+files under tools/.
 """
 
 import importlib.util
@@ -28,6 +30,9 @@ REPO = Path(__file__).resolve().parents[2]
 
 
 def patch(path: Path, replacements):
+    if not path.exists():
+        print(f"skipped {path} (not installed yet; run this again after installing it)")
+        return
     src = path.read_text()
     out = src
     for old, new in replacements:
