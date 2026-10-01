@@ -174,7 +174,7 @@ call "$VCV" >nul
 set "CUDA_HOME=$CUDA12"
 set DISTUTILS_USE_SDK=1
 cd /d "$(winpath "$REPO")"
-uv pip install --python .venv-recon/Scripts/python.exe --no-build-isolation "$FUSED_SSIM"
+uv pip install --python .venv-recon/Scripts/python.exe --no-build-isolation --no-cache "$FUSED_SSIM"
 EOF
     cmd //c "$(winpath "$BAT")"
   fi
