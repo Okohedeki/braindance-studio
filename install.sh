@@ -125,7 +125,8 @@ say "Prerequisites"
 for c in git uv curl; do command -v $c >/dev/null || die "$c not found. Install it first (see docs/INSTALL.md)."; done
 ok "git, uv, curl"
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found: an NVIDIA GPU and driver are required"
-DRIVER_CUDA=$(nvidia-smi | grep -o "CUDA Version: [0-9.]*" | grep -o "[0-9.]*$" || echo 0)
+DRIVER_CUDA=$(nvidia-smi | grep -oE "CUDA (UMD )?Version: [0-9.]+" | grep -oE "[0-9.]+$" | head -1 || true)
+DRIVER_CUDA=${DRIVER_CUDA:-0}
 ok "NVIDIA driver (CUDA $DRIVER_CUDA)"
 if [ "$OBJECTS$INFER" != "00" ] && [ "${TORCH_311_CUDA:-cu130}" = cu130 ] && [ "${DRIVER_CUDA%%.*}" -lt 13 ]; then
   die "the objects/infer environments use PyTorch for CUDA 13.0, which needs a newer driver (yours supports $DRIVER_CUDA). Update the driver, or set TORCH_311_CUDA=cu128."
