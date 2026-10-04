@@ -17,6 +17,8 @@ completion) every splat gets a class:
   4 rebuilt        grown by an object rebuild (LTX orbit) for unseen sides
   5 completed      drawn by geometry-guided completion (LTX along the scene's
                    own depth, scene_bake.py) where no frame had looked
+  6 replaced       an object swapped for one made from a prompt
+                   (object_place.py): not what was recorded at all
 
 Writes viewer/<scene>/trust.bin (per splat: class, frames that saw it,
 capped at 255) and trust.json (classes, counts, method). The GPU render
@@ -40,7 +42,7 @@ sys.path.insert(0, str(HERE))
 from free_space import camera, load_splats  # noqa: E402
 from gsplat.rendering import rasterization  # noqa: E402
 
-CLASSES = {0: "recorded", 1: "recorded once", 2: "filled", 3: "inferred", 4: "rebuilt", 5: "completed"}
+CLASSES = {0: "recorded", 1: "recorded once", 2: "filled", 3: "inferred", 4: "rebuilt", 5: "completed", 6: "replaced"}
 
 
 def main():
@@ -88,6 +90,7 @@ def main():
     cls[flags == 1] = 3
     cls[flags == 2] = 4
     cls[flags == 3] = 5
+    cls[flags == 4] = 6
     (pkg / "trust.bin").write_bytes(np.stack([cls, np.minimum(views_np, 255).astype(np.uint8)], 1).tobytes())
     opac = s["opacities"].cpu().numpy()
     counts = {CLASSES[k]: int((cls == k).sum()) for k in CLASSES}

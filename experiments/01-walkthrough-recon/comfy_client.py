@@ -55,6 +55,48 @@ def upload(path):
     return json.loads(_req("/upload/image", body, {"Content-Type": f"multipart/form-data; boundary={boundary}"}))["name"]
 
 
+QWEN_EDIT = {"unet": "qwen_image_edit_2511_fp8mixed.safetensors",
+             "clip": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+             "vae": "qwen_image_vae.safetensors"}
+
+
+def qwen_edit_graph(prompt, image, prefix, references=(), seed=0, steps=40, cfg=4.0):
+    """Qwen-Image-Edit-2511: edit an image by instruction, after ComfyUI's "Image Edit (Qwen 2511)" blueprint.
+
+    image and references (up to two more, e.g. a photo of the object to put in) are names from upload().
+    The result keeps the input's aspect, scaled to about one megapixel by FluxKontextImageScale."""
+    def encode(text):
+        refs = {f"image{k + 2}": [f"ref{k}", 0] for k in range(len(references))}
+        return {"class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {"clip": ["clip", 0], "prompt": text, "vae": ["vae", 0], "image1": ["scaled", 0], **refs}}
+    graph = {
+        "unet": {"class_type": "UNETLoader", "inputs": {"unet_name": QWEN_EDIT["unet"], "weight_dtype": "default"}},
+        "shift": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["unet", 0], "shift": 3.1}},
+        "norm": {"class_type": "CFGNorm", "inputs": {"model": ["shift", 0], "strength": 1.0}},
+        "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": QWEN_EDIT["clip"], "type": "qwen_image",
+                                                         "device": "default"}},
+        "vae": {"class_type": "VAELoader", "inputs": {"vae_name": QWEN_EDIT["vae"]}},
+        "img": {"class_type": "LoadImage", "inputs": {"image": image}},
+        "scaled": {"class_type": "FluxKontextImageScale", "inputs": {"image": ["img", 0]}},
+        "pos0": encode(prompt),
+        "neg0": encode(""),
+        "pos": {"class_type": "FluxKontextMultiReferenceLatentMethod",
+                "inputs": {"conditioning": ["pos0", 0], "reference_latents_method": "index_timestep_zero"}},
+        "neg": {"class_type": "FluxKontextMultiReferenceLatentMethod",
+                "inputs": {"conditioning": ["neg0", 0], "reference_latents_method": "index_timestep_zero"}},
+        "latent": {"class_type": "VAEEncode", "inputs": {"pixels": ["scaled", 0], "vae": ["vae", 0]}},
+        "sample": {"class_type": "KSampler", "inputs": {
+            "model": ["norm", 0], "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "euler",
+            "scheduler": "simple", "positive": ["pos", 0], "negative": ["neg", 0], "latent_image": ["latent", 0],
+            "denoise": 1.0}},
+        "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae", 0]}},
+        "save": {"class_type": "SaveImage", "inputs": {"images": ["decode", 0], "filename_prefix": prefix}},
+    }
+    for k, ref in enumerate(references):
+        graph[f"ref{k}"] = {"class_type": "LoadImage", "inputs": {"image": ref}}
+    return graph
+
+
 def ltx_depth_graph(prompt, negative, guide_video, first_image, frames, width, height, fps, prefix,
                     guide_strength=0.6, keyframe_strength=1.0, seed=42, keyframes=()):
     """LTX-2.3 22B distilled: the depth video steers camera and shape (IC-LoRA union control),
