@@ -37,6 +37,22 @@ INSTRUCTION = ("Replace the {label} with {prompt}. Keep it in the same place, at
                "angle, standing on the same floor, with light and shadows that match the photo. Change nothing else.")
 
 
+def run_edit(args, instruction, out, crop):
+    """Qwen-Image-Edit-2511 in the local ComfyUI; returns the edited crop and the seconds it took."""
+    if not comfy_client.ready():
+        raise SystemExit("ComfyUI isn't running on " + comfy_client.COMFY)
+    t0 = time.time()
+    refs = [comfy_client.upload(str(args.reference))] if args.reference else []
+    graph = comfy_client.qwen_edit_graph(instruction, comfy_client.upload(str(out / "crop.png")),
+                                         f"braindance/replace{args.object}", references=refs, seed=args.seed,
+                                         steps=args.steps)
+    files = sorted(Path(comfy_client.fetch(comfy_client.run(graph), out / "comfy")).glob("*.png"))
+    edited = Image.open(files[0]).convert("RGB").resize(crop.size, Image.LANCZOS)
+    edited.save(out / "edit_crop.png")
+    comfy_client.free()  # the GPU goes to SAM 3 and TRELLIS.2 next
+    return edited, time.time() - t0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
@@ -48,6 +64,7 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--steps", type=int, default=40)
     ap.add_argument("--work")
+    ap.add_argument("--force", action="store_true", help="edit again even if edit_crop.png exists")
     args = ap.parse_args()
 
     src = HERE / "viewer" / args.scene
@@ -76,29 +93,23 @@ def main():
     crop = frame.crop(box)
     crop.save(out / "crop.png")
 
-    # 2. edit
-    if not comfy_client.ready():
-        raise SystemExit("ComfyUI isn't running on " + comfy_client.COMFY)
-    t0 = time.time()
+    # 2. edit (kept: rerunning only redoes the steps after it, unless --force)
     instruction = INSTRUCTION.format(label=obj["label"], prompt=args.prompt)
-    refs = [comfy_client.upload(str(args.reference))] if args.reference else []
-    graph = comfy_client.qwen_edit_graph(instruction, comfy_client.upload(str(out / "crop.png")),
-                                         f"braindance/replace{args.object}", references=refs, seed=args.seed,
-                                         steps=args.steps)
-    saved = comfy_client.run(graph)
-    files = sorted(Path(comfy_client.fetch(saved, out / "comfy")).glob("*.png"))
-    edited = Image.open(files[0]).convert("RGB").resize(crop.size, Image.LANCZOS)
-    edited.save(out / "edit_crop.png")
+    if (out / "edit_crop.png").exists() and not args.force:
+        edited = Image.open(out / "edit_crop.png").convert("RGB")
+        edit_seconds = json.loads((out / "edit.json").read_text()).get("editSeconds") if (out / "edit.json").exists() else None
+    else:
+        edited, edit_seconds = run_edit(args, instruction, out, crop)
     full = frame.copy()
     full.paste(edited, box[:2])
     full.save(out / "edit.png")
-    edit_seconds = time.time() - t0
-    comfy_client.free()  # the GPU goes to SAM 3 and TRELLIS.2 next
 
     # 3. find the new object
     masks = out / "masks"
+    env = {k: v for k, v in os.environ.items()  # another Python: none of this one's settings
+           if k not in ("__PYVENV_LAUNCHER__", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}
     subprocess.run([str(SAM_PY), str(HERE / "segment_prompt.py"), "--image", str(out / "edit_crop.png"),
-                    "--prompt", args.kind or obj["label"], "--out", str(masks)], check=True)
+                    "--prompt", args.kind or obj["label"], "--out", str(masks)], check=True, env=env)
     inst = json.loads((masks / "instances.json").read_text())["instances"]
     old_crop = old_full[box[1]:box[3], box[0]:box[2]]
     best, best_overlap = None, 0.0
@@ -130,7 +141,7 @@ def main():
     Image.fromarray(rgba, "RGBA").save(out / "object.png")
 
     report = {"object": args.object, "was": obj["label"], "prompt": args.prompt, "instruction": instruction,
-              "frame": name, "crop": box, "seed": args.seed, "steps": args.steps, "editSeconds": round(edit_seconds, 1),
+              "frame": name, "crop": box, "seed": args.seed, "steps": args.steps, "editSeconds": round(edit_seconds, 1) if edit_seconds else None,
               "samPrompt": args.kind or obj["label"], "overlapWithOld": round(float(best_overlap), 3),
               "newPixels": int(new_full.sum()), "oldPixels": int(old_full.sum()),
               "reference": str(args.reference) if args.reference else None, "model": comfy_client.QWEN_EDIT["unet"]}
