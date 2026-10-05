@@ -49,13 +49,14 @@ def held_out_psnr(scene, work, scale=0.5):
     return round(float(np.mean(vals)), 2)
 
 
-def integrate(cols, trainable, opacity_only, work, mode, steps, scale=0.5):
+def integrate(cols, trainable, opacity_only, work, mode, steps, scale=0.5, only=None):
     """Fit the swapped-in objects into the scene on every recorded training frame (whole frames).
 
     The per-object fit only saw each object alone; in the scene its grown splats can haze views the
     object isn't in, and splats of the object that SAM's masks missed are still in the scene, doubling
     it up. Here only the rebuilt objects' splats train, plus the opacity of other splats inside their
-    boxes (so leftover pieces can fade); everything else stays as it was."""
+    boxes (so leftover pieces can fade); everything else stays as it was. only: train just these parameter
+    groups (e.g. {"opacities", "sh0", "shN"}) of the trainable splats."""
     import random
     import torch.nn.functional as F
     from fused_ssim import fused_ssim
@@ -103,7 +104,10 @@ def integrate(cols, trainable, opacity_only, work, mode, steps, scale=0.5):
         loss.backward()
         for k, v in p.items():
             if v.grad is not None:
-                v.grad[~(train_opacity if k == "opacities" else train_all)] = 0
+                if only is not None and k not in only:
+                    v.grad.zero_()
+                else:
+                    v.grad[~(train_opacity if k == "opacities" else train_all)] = 0
         for o in opts.values():
             o.step()
             o.zero_grad(set_to_none=True)

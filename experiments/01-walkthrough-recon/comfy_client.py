@@ -21,7 +21,8 @@ DISTILLED_SIGMAS = "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421
 # The models scroll-studio installed (D:\ai\ComfyUI, files on E:\ai\models).
 LTX = {"checkpoint": "ltx-2.3-22b-distilled-fp8.safetensors",
        "text_encoder": "gemma_3_12B_it_fp8_scaled.safetensors",
-       "control_lora": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors"}
+       "control_lora": "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
+       "motion_lora": "ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors"}
 
 
 def _req(path, data=None, headers=None, timeout=600):
@@ -114,6 +115,21 @@ def ltx_depth_graph(prompt, negative, guide_video, first_image, frames, width, h
     graph["av"]["inputs"]["video_latent"] = [last, 2]
     graph["guider"]["inputs"].update(positive=[last, 0], negative=[last, 1])
     graph["crop"]["inputs"].update(positive=[last, 0], negative=[last, 1])
+    return graph
+
+
+def ltx_motion_graph(prompt, negative, tracks, first_image, frames, width, height, fps, prefix,
+                     guide_strength=1.0, keyframe_strength=1.0, seed=42):
+    """LTX-2.3 22B distilled with the Motion-Track-Control IC-LoRA, after Lightricks' "LTX-2.3 IC-LoRA Motion
+    Track (distilled)" example: tracks (JSON, a list of tracks, each a list of {x, y} per frame in output
+    pixels; a shorter track stops being drawn where it ends) are drawn as the guide by LTXVDrawTracks, and
+    things in the first image move along them."""
+    graph = _ltx_graph(prompt, negative, None, first_image, frames, width, height, fps, prefix,
+                       guide_strength, keyframe_strength, seed)
+    del graph["guide_vid"], graph["guide"]
+    graph["iclora"]["inputs"]["lora_name"] = LTX["motion_lora"]
+    graph["draw"] = {"class_type": "LTXVDrawTracks", "inputs": {"tracks": tracks, "width": width, "height": height}}
+    graph["addguide"]["inputs"]["image"] = ["draw", 0]
     return graph
 
 

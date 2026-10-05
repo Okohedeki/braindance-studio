@@ -80,6 +80,10 @@ def main():
     ap.add_argument("--every", type=int, default=12, help="query frame spacing")
     ap.add_argument("--grid", type=int, nargs=2, default=[48, 27], help="query grid (x, y) per query frame")
     ap.add_argument("--window", type=int, default=90, help="frames tracked forward and back from each query frame")
+    ap.add_argument("--texture", type=float, default=40, help="Sobel gradient a query pixel needs (0-255 scale)")
+    ap.add_argument("--name", help="output name under work/<work>/tap (default: points, or points_<path>)")
+    ap.add_argument("--path", help="track a generated completion path instead (work/<work>/complete/<path>: gen/ "
+                                   "frames and their cameras); tells which generated content holds still in 3D")
     ap.add_argument("--min-views", type=int, default=5)
     ap.add_argument("--min-angle", type=float, default=2.0, help="degrees between the most separated views")
     ap.add_argument("--max-px", type=float, default=2.0, help="reprojection error allowed, full-frame pixels")
@@ -87,16 +91,30 @@ def main():
 
     scene_dir = HERE / "viewer" / args.scene
     work = HERE / "work" / (args.work or args.scene.split("-")[0])
-    frames = json.loads((scene_dir / "scene.json").read_text())["frames"]
-    clips = sorted({f["name"].split("/")[0] for f in frames})
+    args.name = args.name or (f"points_{args.path}" if args.path else "points")
+    if args.path:  # a generated path: its frames and the cameras they were generated for
+        pdir = work / "complete" / args.path
+        cams = json.loads((pdir / "cameras.json").read_text())
+        K0 = cams["K"]
+        frames = [{"name": str(pdir / "gen" / f"{k:04d}.png"), "c2w": m, "fx": K0[0][0], "fy": K0[1][1], "cx": K0[0][2],
+                   "cy": K0[1][2]} for k, m in enumerate(cams["c2w"]) if (pdir / "gen" / f"{k:04d}.png").exists()]
+        image_path = lambda f: f["name"]
+        clips = ["gen"]
+        clip_of = lambda f: "gen"
+    else:
+        frames = json.loads((scene_dir / "scene.json").read_text())["frames"]
+        image_path = lambda f: work / "train" / "images" / f["name"]
+        clip_of = lambda f: f["name"].split("/")[0]
+        clips = sorted({clip_of(f) for f in frames})
     model = TAPNextPP.from_checkpoint(CKPT, device="cuda", input_resolution=512)
     inner = model._model
     t0 = time.time()
     all_xyz, all_rgb, all_views, all_angle, all_err, obs = [], [], [], [], [], []
+    queries = []  # every track, kept or not: query frame, x, y, kept, error, views
     n_tracks = 0
     for clip in clips:
-        idx = [i for i, f in enumerate(frames) if f["name"].split("/")[0] == clip]
-        imgs = [cv2.imread(str(work / "train" / "images" / frames[i]["name"]), cv2.IMREAD_COLOR) for i in idx]
+        idx = [i for i, f in enumerate(frames) if clip_of(f) == clip]
+        imgs = [cv2.imread(str(image_path(frames[i])), cv2.IMREAD_COLOR) for i in idx]
         H, W = imgs[0].shape[:2]
         cache = torch.stack([F.interpolate(torch.from_numpy(im[..., ::-1].copy()).cuda().permute(2, 0, 1)[None].float(),
                                            size=(512, 512), mode="bilinear", align_corners=False)[0]
@@ -113,7 +131,7 @@ def main():
             gx, gy = np.meshgrid((np.arange(args.grid[0]) + 0.5) / args.grid[0] * W,
                                  (np.arange(args.grid[1]) + 0.5) / args.grid[1] * H)
             pts = np.stack([gx.ravel(), gy.ravel()], 1).astype(np.float32)
-            pts = pts[grad[pts[:, 1].astype(int), pts[:, 0].astype(int)] > 40]  # texture to follow
+            pts = pts[grad[pts[:, 1].astype(int), pts[:, 0].astype(int)] > args.texture]  # texture to follow
             if len(pts) < 10:
                 continue
             qt = torch.zeros(1, len(pts), 3, device="cuda")
@@ -132,6 +150,7 @@ def main():
             rgb = imgs[q][pts[:, 1].astype(int), pts[:, 0].astype(int), ::-1] / 255.0
             ts = sorted(track)
             X, keep, err_p, angle, views, used = solve(ts, track, c2w_t, Kinv_t, K_t, args)
+            queries.extend((idx[q], x, y, k, e, vw) for (x, y), k, e, vw in zip(pts, keep, err_p, views))
             for p in np.nonzero(keep)[0]:
                 k = len(all_xyz)
                 all_xyz.append(X[p])
@@ -149,9 +168,10 @@ def main():
     out = work / "tap"
     out.mkdir(parents=True, exist_ok=True)
     obs = np.array(obs, np.float64).reshape(-1, 4)
-    np.savez_compressed(out / "points.npz", xyz=np.array(all_xyz, np.float32), rgb=np.array(all_rgb, np.float32),
+    np.savez_compressed(out / f"{args.name}.npz", xyz=np.array(all_xyz, np.float32), rgb=np.array(all_rgb, np.float32),
                         views=np.array(all_views, np.int32), angle=np.array(all_angle, np.float32),
                         err=np.array(all_err, np.float32), obs_point=obs[:, 0].astype(np.int32),
+                        queries=np.array(queries, np.float32).reshape(-1, 6),
                         obs_frame=obs[:, 1].astype(np.int32), obs_xy=obs[:, 2:].astype(np.float32))
     report = {"scene": args.scene, "tracks": n_tracks, "points": len(all_xyz), "observations": len(obs),
               "kept": round(len(all_xyz) / max(1, n_tracks), 3),
@@ -159,7 +179,7 @@ def main():
               "medianAngleDeg": round(float(np.median(all_angle)), 1) if all_angle else 0,
               "medianErrorPx": round(float(np.median(all_err)), 2) if all_err else 0,
               "minutes": round((time.time() - t0) / 60, 1), "settings": vars(args)}
-    (out / "points.json").write_text(json.dumps(report, indent=1))
+    (out / f"{args.name}.json").write_text(json.dumps(report, indent=1))
     print(json.dumps({k: v for k, v in report.items() if k != "settings"}))
 
 
