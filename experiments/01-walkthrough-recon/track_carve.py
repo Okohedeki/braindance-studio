@@ -1,6 +1,7 @@
 """Clear the haze in front of surfaces, using points the camera is known to have seen clearly.
 
   python track_carve.py --scene courtyard-walk2 --points points_dense --out courtyard-clear
+  python track_carve.py --scene courtyard-tapB --points points_p10 points_p11 points_p13 --out courtyard-clearB
 
 Each observation from track_triangulate.py is a line of sight: in that recorded frame the camera saw the
 point, at a depth we know from many views, through everything in front of it. A splat whose centre falls
@@ -8,6 +9,10 @@ on that pixel more than --margin nearer than the point sits in space the camera 
 through by at least --min-hits observations are haze and are removed; with --fit, the scene then trains
 briefly on the recorded frames (colours and opacity only, so the cleared space stays clear) to take back
 what the haze was doing for the recorded views.
+
+Points from a generated path (track_triangulate.py --path pNN, named points_pNN) count the same way in that
+path's cameras: where the generated frames agree on a surface across many views, they saw clear to it, and
+these are the views the recording never had, where the fog is.
 
 Why: the splats' rendered depth is 14% nearer than the tracked points (median, courtyard), and only 0.5%
 when the semi-transparent splats are left out: a veil in front of the surfaces, which is what fog is from
@@ -35,7 +40,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--points", default="points", help="track_triangulate.py output name")
+    ap.add_argument("--points", nargs="+", default=["points"], help="track_triangulate.py outputs (points_pNN: a path)")
     ap.add_argument("--work")
     ap.add_argument("--margin", type=float, default=0.05, help="how much nearer than the point counts as in front")
     ap.add_argument("--min-hits", type=int, default=2, help="observations a splat must block to be haze")
@@ -45,10 +50,17 @@ def main():
     args = ap.parse_args()
     src = HERE / "viewer" / args.scene
     work = HERE / "work" / (args.work or args.scene.split("-")[0])
-    pts = np.load(work / "tap" / f"{args.points}.npz")
-    xyz, op, of, oxy = pts["xyz"], pts["obs_point"], pts["obs_frame"], pts["obs_xy"]
     meta = json.loads((src / "scene.json").read_text())
-    frames = meta["frames"]
+    sets = []  # (xyz, obs_point, obs_frame, obs_xy, frames)
+    for name in args.points:
+        pts = np.load(work / "tap" / f"{name}.npz")
+        frames = meta["frames"]
+        if name.startswith("points_p"):  # a generated path: its own cameras
+            cams = json.loads((work / "complete" / name[len("points_"):] / "cameras.json").read_text())
+            (fx, _, cx), (_, fy, cy) = cams["K"][0], cams["K"][1]
+            frames = [{"c2w": m, "fx": fx, "fy": fy, "cx": cx, "cy": cy, "width": cams["W"], "height": cams["H"]}
+                      for m in cams["c2w"]]
+        sets.append((pts["xyz"], pts["obs_point"], pts["obs_frame"], pts["obs_xy"], frames))
     cols = read_ply(src / "scene.ply")
     n = len(cols["x"])
     means = torch.tensor(np.stack([cols["x"], cols["y"], cols["z"]], 1), dtype=torch.float32, device="cuda")
@@ -56,35 +68,36 @@ def main():
     hits = torch.zeros(n, dtype=torch.int32, device="cuda")
     support = torch.zeros(n, dtype=torch.int32, device="cuda")
     t0 = time.time()
-    for fi in np.unique(of):
-        f = frames[fi]
-        s = args.scale
-        w, h = int(f["width"] * s), int(f["height"] * s)
-        c2w = np.asarray(f["c2w"], np.float64)
-        sel = of == fi
-        z = ((xyz[op[sel]] - c2w[:3, 3]) @ c2w[:3, :3])[:, 2]
-        u = np.clip((oxy[sel, 0] * s).astype(int), 0, w - 1)
-        v = np.clip((oxy[sel, 1] * s).astype(int), 0, h - 1)
-        clear = torch.full((h, w), float("inf"), device="cuda")  # depth the camera saw clearly to, per pixel
-        for dy in range(-args.radius, args.radius + 1):
-            for dx in range(-args.radius, args.radius + 1):
-                uu, vv = np.clip(u + dx, 0, w - 1), np.clip(v + dy, 0, h - 1)
-                flat = torch.tensor(vv * w + uu, dtype=torch.int64, device="cuda")
-                clear.view(-1).scatter_reduce_(0, flat, torch.tensor(z, dtype=torch.float32, device="cuda"), "amin")
-        R = torch.tensor(c2w[:3, :3], dtype=torch.float32, device="cuda")
-        C = torch.tensor(c2w[:3, 3], dtype=torch.float32, device="cuda")
-        pc = (means - C) @ R
-        zc = pc[:, 2]
-        ui = (pc[:, 0] / zc.clamp(min=1e-6) * f["fx"] * s + f["cx"] * s).long()
-        vi = (pc[:, 1] / zc.clamp(min=1e-6) * f["fy"] * s + f["cy"] * s).long()
-        inside = (zc > 1e-3) & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
-        zclear = torch.full_like(zc, float("inf"))
-        zclear[inside] = clear[vi[inside], ui[inside]]
-        known = torch.isfinite(zclear)
-        hits += (known & (zc < zclear * (1 - args.margin))).int()
-        support += (known & ((zc / zclear - 1).abs() <= args.margin)).int()
+    for xyz, op, of, oxy, frames in sets:
+        for fi in np.unique(of):
+            f = frames[fi]
+            s = args.scale
+            w, h = int(f["width"] * s), int(f["height"] * s)
+            c2w = np.asarray(f["c2w"], np.float64)
+            sel = of == fi
+            z = ((xyz[op[sel]] - c2w[:3, 3]) @ c2w[:3, :3])[:, 2]
+            u = np.clip((oxy[sel, 0] * s).astype(int), 0, w - 1)
+            v = np.clip((oxy[sel, 1] * s).astype(int), 0, h - 1)
+            clear = torch.full((h, w), float("inf"), device="cuda")  # depth the camera saw clearly to, per pixel
+            for dy in range(-args.radius, args.radius + 1):
+                for dx in range(-args.radius, args.radius + 1):
+                    uu, vv = np.clip(u + dx, 0, w - 1), np.clip(v + dy, 0, h - 1)
+                    flat = torch.tensor(vv * w + uu, dtype=torch.int64, device="cuda")
+                    clear.view(-1).scatter_reduce_(0, flat, torch.tensor(z, dtype=torch.float32, device="cuda"), "amin")
+            R = torch.tensor(c2w[:3, :3], dtype=torch.float32, device="cuda")
+            C = torch.tensor(c2w[:3, 3], dtype=torch.float32, device="cuda")
+            pc = (means - C) @ R
+            zc = pc[:, 2]
+            ui = (pc[:, 0] / zc.clamp(min=1e-6) * f["fx"] * s + f["cx"] * s).long()
+            vi = (pc[:, 1] / zc.clamp(min=1e-6) * f["fy"] * s + f["cy"] * s).long()
+            inside = (zc > 1e-3) & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
+            zclear = torch.full_like(zc, float("inf"))
+            zclear[inside] = clear[vi[inside], ui[inside]]
+            known = torch.isfinite(zclear)
+            hits += (known & (zc < zclear * (1 - args.margin))).int()
+            support += (known & ((zc / zclear - 1).abs() <= args.margin)).int()
     haze = hits >= args.min_hits
-    report = {"scene": args.scene, "out": args.out, "points": args.points, "observations": int(len(op)),
+    report = {"scene": args.scene, "out": args.out, "points": args.points, "observations": int(sum(len(x[1]) for x in sets)),
               "splats": n, "haze": int(haze.sum()), "hazeShare": round(float(haze.float().mean()), 4),
               "hazeMeanOpacity": round(float(opac[haze].mean()), 3) if haze.any() else None,
               "keptMeanOpacity": round(float(opac[~haze].mean()), 3),

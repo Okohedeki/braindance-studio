@@ -68,6 +68,11 @@ def main():
     ap.add_argument("--lift-every", type=int, default=4, help="lift every Nth frame of a path")
     ap.add_argument("--lift-stride", type=int, default=4, help="new splats from every Nth pixel")
     ap.add_argument("--max-new", type=int, default=400000)
+    ap.add_argument("--tracks", action="store_true",
+                    help="use TAPNext++ tracks through the generated frames (track_triangulate.py --path pNN): content "
+                         "that holds still in 3D teaches fully and sets the lift's depth scale; textured content that "
+                         "didn't track (it wobbled from frame to frame) teaches little; fitted depth held to the points")
+    ap.add_argument("--track-depth", type=float, default=0.2, help="weight of the tracked-depth loss")
     ap.add_argument("--carve-margin", type=float, default=0.05,
                     help="drop a lifted splat if a recorded frame saw more than this (relative depth) past it")
     args = ap.parse_args()
@@ -96,12 +101,15 @@ def main():
     flags = (np.frombuffer((src / "inferred.bin").read_bytes(), np.uint8).copy() if (src / "inferred.bin").exists()
              else np.zeros(n, np.uint8))
 
-    def render(c2w, K, w, h, grad=False):
+    def render(c2w, K, w, h, grad=False, depth=False):
         with torch.set_grad_enabled(grad):
             img, alpha, _ = rasterization(
                 params["means"], F.normalize(params["quats"], dim=1), torch.exp(params["scales"]),
                 torch.sigmoid(params["opacities"]), torch.cat([params["sh0"], params["shN"]], 1),
-                torch.linalg.inv(c2w)[None], K[None], w, h, sh_degree=3, rasterize_mode=mode)
+                torch.linalg.inv(c2w)[None], K[None], w, h, sh_degree=3, rasterize_mode=mode,
+                render_mode="RGB+ED" if depth else "RGB")
+        if depth:
+            return img[0, ..., :3].clamp(0, 1), alpha[0, ..., 0], img[0, ..., 3]
         return img[0].clamp(0, 1), alpha[0, ..., 0]
 
     # recorded frames, as the scene was trained on them
@@ -161,6 +169,43 @@ def main():
     print(f"{len(recorded)} recorded frames, {len(novel)} generated frames from {len(paths)} paths; "
           f"{int(frozen.sum())} of {n} splats frozen as recorded", flush=True)
 
+    # tracks through the generated frames: where the content holds still in 3D, and how deep it is
+    track_report = {}
+    if args.tracks:
+        for name in sorted({v["path"] for v in novel}):
+            tf = work / "tap" / f"points_{name}.npz"
+            if not tf.exists():
+                print(f"  no tracks for {name} (track_triangulate.py --path {name}): taught as before", flush=True)
+                continue
+            tp = np.load(tf)
+            cams = json.loads((work / "complete" / name / "cameras.json").read_text())
+            n_frames = 0
+            for v in (v for v in novel if v["path"] == name):
+                sel = tp["obs_frame"] == v["frame"]
+                if sel.sum() < 10:
+                    continue
+                c2w = np.asarray(cams["c2w"][v["frame"]], np.float64)
+                z = ((tp["xyz"][tp["obs_point"][sel]] - c2w[:3, 3]) @ c2w[:3, :3])[:, 2]
+                uv = np.clip(np.round(tp["obs_xy"][sel]).astype(np.int64), 0, [v["W"] - 1, v["H"] - 1])
+                new = v["teach"].numpy()[uv[:, 1], uv[:, 0]] & (z > 0)  # only what this frame may teach
+                if new.sum() < 10:
+                    continue
+                uv, z = uv[new], z[new]
+                v["obs_uv"], v["obs_z"] = torch.tensor(uv), torch.tensor(z, dtype=torch.float32)
+                # teach weight: textured content near a track that held counts fully, textured content with none
+                # (it didn't track: it wobbled) counts a quarter, flat areas (nothing to judge by) in between
+                g = (v["gt"].cuda().float()).mean(2)
+                grad = torch.zeros_like(g)
+                grad[1:-1, 1:-1] = ((g[1:-1, 2:] - g[1:-1, :-2]) ** 2 + (g[2:, 1:-1] - g[:-2, 1:-1]) ** 2).sqrt()
+                near = torch.zeros_like(g)
+                near[uv[:, 1], uv[:, 0]] = 1
+                near = F.max_pool2d(near[None, None], 25, stride=1, padding=12)[0, 0] > 0
+                conf = torch.where(grad > 20, torch.where(near, 1.0, 0.25), torch.tensor(0.7, device="cuda"))
+                v["weight"] = (v["teach"].cuda().float() * conf * 255).byte().cpu().pin_memory()
+                n_frames += 1
+            track_report[name] = {"frames": n_frames, "points": int(len(tp["xyz"]))}
+        print(f"  tracks: {track_report}", flush=True)
+
     # new splats for what the lifted paths show where nothing was recorded
     n_new = 0
     if args.lift:
@@ -184,9 +229,15 @@ def main():
             valid = m["mask"].bool() & torch.isfinite(dm) & (dm > 0)
             teach = v["teach"].cuda()
             known = ~teach & (alpha > 0.95) & valid & (depth_r > 0)
-            if known.sum() < 500:
+            tracked = None
+            if "obs_uv" in v:  # put MoGe's depth to scale on the points tracked in this frame's new content
+                uv, zt = v["obs_uv"].cuda(), v["obs_z"].cuda()
+                inside = teach[uv[:, 1], uv[:, 0]] & valid[uv[:, 1], uv[:, 0]]
+                if inside.sum() >= 20:
+                    tracked = float(torch.median(zt[inside] / dm[uv[inside, 1], uv[inside, 0]]))
+            if tracked is None and known.sum() < 500:
                 continue  # no recorded surface in view to put the depth to scale
-            scale = float(torch.median(depth_r[known] / dm[known]))
+            scale = tracked if tracked is not None else float(torch.median(depth_r[known] / dm[known]))
             grid = torch.zeros_like(teach)
             grid[::args.lift_stride, ::args.lift_stride] = True
             ys, xs = torch.nonzero(teach & valid & grid, as_tuple=True)
@@ -299,12 +350,17 @@ def main():
             v = novel[i]
             c2w, K, w, h = corrected(i), v["K"], v["W"], v["H"]
             gt = v["gt"].to("cuda", non_blocking=True).float() / 255
-            m = v["teach"].to("cuda", non_blocking=True)[..., None].float()
+            m = (v["weight"].to("cuda", non_blocking=True).float() / 255 if "weight" in v
+                 else v["teach"].to("cuda", non_blocking=True).float())[..., None]
         else:
             c2w, K, w, h, img = random.choice(recorded)
             gt = img.to("cuda", non_blocking=True).float() / 255
             m = None
-        pred, _ = render(c2w, K, w, h, grad=True)
+        tracked = use_novel and "obs_uv" in v
+        if tracked:
+            pred, alpha_t, depth_t = render(c2w, K, w, h, grad=True, depth=True)
+        else:
+            pred, _ = render(c2w, K, w, h, grad=True)
         if m is not None:
             gt = m * gt + (1 - m) * pred.detach()  # outside what it may teach: no pull either way
             share = float(m.mean())
@@ -313,6 +369,11 @@ def main():
         l1 = (pred - gt).abs().mean()
         ssim = fused_ssim(pred.permute(2, 0, 1)[None], gt.permute(2, 0, 1)[None], padding="valid")
         loss = (0.8 * l1 + 0.2 * (1 - ssim)) / share * (args.novel_weight if use_novel else 1.0)
+        if tracked:  # hold the fitted depth to the points the generated frames agree on
+            uv, zt = v["obs_uv"].cuda(), v["obs_z"].cuda()
+            seen = alpha_t[uv[:, 1], uv[:, 0]] > 0.5
+            if seen.sum() > 10:
+                loss = loss + args.track_depth * (depth_t[uv[seen, 1], uv[seen, 0]] / zt[seen] - 1).abs().mean()
         loss.backward()
         for k, p in params.items():
             if p.grad is not None:
@@ -364,7 +425,7 @@ def main():
     (out / "scene.json").write_text(json.dumps(meta, indent=1))
     report = {"scene": args.scene, "out": args.out, "paths": paths, "generatedFrames": len(novel),
               "frozenSplats": int(frozen.sum()), "changedSplats": int(changed.sum()), "newSplats": n_new,
-              "lifted": args.lift, "steps": args.steps,
+              "lifted": args.lift, "steps": args.steps, "tracks": track_report or None,
               "before": before, "after": after, "minutes": round(minutes, 1),
               "cameraCorrectionMaxDeg": round(float(delta[:, :3].norm(dim=1).max() * 0.1 * 180 / math.pi), 2)}
     (out / "complete.json").write_text(json.dumps(report, indent=1))
