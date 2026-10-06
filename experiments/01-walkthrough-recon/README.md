@@ -649,3 +649,41 @@ After geometry refinement and colour polish, held-out PSNR is 28.91 dB (courtyar
 - **Past the sofa (p13, `work/captures/walk_p13_v3.mp4`), better.** The first half matches the recording as before. Behind the sofa you see the terrace, palm, planter and glass doors; in the first run the same view was fog. Looking back at the end you get sky, the far buildings in evening light, the boundary wall and planting where there was glass: soft, but a place.
 - **End of p11 (`work/captures/walk_p11_v3.mp4`), still murky.** The camera finishes almost against the planting next to the sofa. LTX's frames there are clean (trees, wall, pergola; `work/review/p11_gen_sheet_v2.jpg`), but they don't agree with the scene's guide at those frames. The fit holds its middle frames and not these last ones.
 - **Free roam at 1.4× reach (`work/captures/courtyard_roam_walk2.mp4`), little change.** This test spends most of its time pressed against walls and the pergola ceiling. It is only better in the garden stretch.
+
+## V2: point tracking (TAPNext++), to steer and check generation
+
+[TAPNext++](https://github.com/google-deepmind/tapnet) (PyTorch, 512 px checkpoint) follows any point through a clip and catches it again after it is hidden. It runs on cached 512×512 fp16 frames, forward and back from query frames.
+
+**Points from tracks** (`track_triangulate.py`). From every 8th frame, a grid of textured points is tracked ±90 frames, and each track is triangulated through the recorded cameras on the GPU (least-squares meeting of the rays; views more than 2 px off are dropped and it is solved again). A point is kept with at least 5 views spanning at least 2°. Courtyard, 96×54 grid: 26,824 points from 1.13M observations, median 37 views, 15° of baseline, 1.29 px error, 11 minutes.
+
+**What they say about the fog** (`track_depth_check.py`):
+- Recorded views: the scene's rendered depth is 14% nearer than the tracked points (median). Counting only splats with opacity above 0.9 it is 0.5%: a veil of half-transparent splats in front of the surfaces.
+- Removing splats that recorded frames saw through to a tracked point (`track_carve.py`, 56,510 splats, 2.2%) cost 1.2 dB held out (28.91 → 27.74) and barely changed the look-back fog. That fog isn't in the recorded parts.
+- Generated walk paths: tracking LTX's own frames (`track_triangulate.py --path pNN`, 64×36 grid, about 1 minute a path) keeps 67–75% of tracks at 0.8–1.1 px. Measured in those paths' cameras, where nothing was recorded, courtyard-walk2 sits in front of the tracked surfaces: median error 25% (p10), 18% (p11), 15% (p13); 56–82% of points more than 10% too near.
+
+**Re-fitting with them** (`scene_bake.py --tracks`): the tracked points set MoGe-2's depth scale for the lift; textured pixels with no track nearby (content that wobbled between frames) teach at a quarter weight; and a depth loss holds the render to the tracked points. Same nine paths from courtyard-final, 8000 steps, with and without:
+
+| | Held-out recorded | Never-recorded vs LTX | Sharpness in completed areas | Depth error vs path tracks (median, p10–p14) |
+|---|---|---|---|---|
+| without (`courtyard-tapA`) | 28.65 | 24.45 | 2.51 | 24%, 16%, 13%, 11%, 15% |
+| with (`courtyard-tapB`) | 28.02 | 24.42 | 2.78 | 17%, 10%, 6%, 7%, 6% |
+
+The depth now agrees with what the generated frames show (partly what it was trained on), and completed areas are 11% sharper, but the look-back views (`work/captures/tracks_p13.mp4`, `tracks_p10.mp4`) look only slightly better. LTX drew that fog into its frames, because its guides were rendered from the foggy scene. Carving with the path tracks as well (`courtyard-clearB`) removed recorded content: held out 28.02 → 26.20 dB. Not used.
+
+**Filming a move** (`motion_edit.py`, `motion_check.py`; the viewer's **Film this move**). LTX-2.3's motion-track IC-LoRA moves things along point tracks, drawn as coloured trails (`LTXVDrawTracks`), from a first frame. Here every track is computed:
+- the background's are triangulated points, tracked through the whole stretch, projected through the recorded cameras interpolated to 24 fps; so the camera moves as it really did;
+- the object's are 16 of its surface splats in view in the first frame, moved by the edit (slide and turn, eased in and out); a background track stops where the moved object would cover it;
+- the stretch of the recording is picked where the object stays in view where it is and where it goes.
+
+`motion_check.py` tracks the first point of every track through the result with TAPNext++. On the real recording as a baseline, the background tracks match to 3.4 px and the sofa counts as not moved (0%).
+
+| Courtyard sofa | Object error | Camera error | Object points at the new place | Time |
+|---|---|---|---|---|
+| slide 0.9 m toward the camera | 3.8 px | 11.3 px | 90% | 9.1 min |
+| turn 40° | 11.0 px | 8.4 px | 62% | 9 min |
+| 0.6 m and 15°, from the viewer | 6.6 px | 6.4 px | 100% | 6.6 min |
+
+What doesn't work yet:
+- Where the camera pans onto what the first frame doesn't show, LTX invents it: a pool, a palm, an extra armchair. Keyframes from the recording would fix the background, but they also show the object where it was.
+- The 40° turn shrank the sofa to a two-seater.
+- With the viewer's GPU worker holding Difix (about 5 GB), LTX's text encoder didn't fit beside it. Windows spilled VRAM into system memory, and the encode step crawled for 10 minutes before it was stopped. Now the worker moves Difix to system memory while a viewer job runs (`work/gpu_busy.json`).

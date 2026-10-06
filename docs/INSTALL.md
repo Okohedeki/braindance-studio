@@ -192,9 +192,50 @@ The rebuild, completion and walk stages send their jobs to a local [ComfyUI](htt
    python main.py --listen 127.0.0.1 --port 8188 --reserve-vram 1.5
    ```
 
-LTX uses most of a 24 GB card. Stop the GPU render worker while generating; the scripts unload ComfyUI's models before each fit.
+LTX uses most of a 24 GB card. Stop the GPU render worker while generating; the scripts unload ComfyUI's models before each fit. (Jobs started from the viewer, such as filming a move, don't need that: the worker moves Difix off the GPU while they run.)
 
-## 5. Get the demo footage
+## 5. Tracking, motion edits and the 2D replace step (V2)
+
+These set up point tracking (TAPNext++), filming a move from the viewer, and the 2D step of replacing an object from a prompt. They aren't in `install.sh` yet.
+
+1. **TAPNext++** runs in `.venv-sam3`, from DeepMind's repository:
+
+   ```bash
+   git clone https://github.com/google-deepmind/tapnet.git tools/tapnet && git -C tools/tapnet checkout 730cda1
+   uv pip install --python .venv-sam3/Scripts/python.exe einops==0.8.1
+   mkdir -p tools/models/tapnextpp
+   curl -L -o tools/models/tapnextpp/tapnextpp_512.ckpt https://storage.googleapis.com/gresearch/tapnextpp/tapnextpp_512.ckpt   # 2.53 GB
+   ```
+
+2. **Model files for ComfyUI** (as in section 4):
+
+   | Folder | File | From | Size |
+   |---|---|---|---|
+   | `loras/` | `ltx-2.3-22b-ic-lora-motion-track-control-ref0.5.safetensors` | [Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Motion-Track-Control) | 0.33 GB |
+   | `diffusion_models/` | `qwen_image_edit_2511_fp8mixed.safetensors` | [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI), `split_files/diffusion_models/` | 20.5 GB |
+   | `text_encoders/` | `qwen_2.5_vl_7b_fp8_scaled.safetensors` | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI), `split_files/text_encoders/` | 9.4 GB |
+   | `vae/` | `qwen_image_vae.safetensors` | [Comfy-Org/Qwen-Image_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI), `split_files/vae/` | 0.25 GB |
+
+   The motion LoRA uses the `LTXVDrawTracks` and `LTXICLoRALoaderModelOnly` nodes from ComfyUI-LTXVideo (section 4). The two Qwen files are only for `object_edit.py`.
+
+3. **ComfyUI flags.** On a 24 GB card, start ComfyUI with `--disable-dynamic-vram --disable-smart-memory`; dynamic VRAM made Qwen-Image-Edit about 5× slower. `comfy_client.ensure_running()` starts it this way by itself when a script needs it and it isn't running (set `COMFY_DIR` if it isn't in `D:\ai\ComfyUI`).
+
+4. **Points for a scene.** Filming a move steers the camera with points triangulated from TAPNext++ tracks through the recording. Make them once per scene (about 11 minutes on a 4090):
+
+   ```bash
+   .venv-sam3/Scripts/python.exe experiments/01-walkthrough-recon/track_triangulate.py --scene courtyard-walk2 --grid 96 54 --texture 20 --every 8 --name points_dense
+   ```
+
+Then, in the viewer (served by `serve.py`): select an object, move or turn it, and press **Film this move**. It takes 6–10 minutes. Or run it from the command line:
+
+```bash
+.venv-recon/Scripts/python.exe experiments/01-walkthrough-recon/motion_edit.py --scene courtyard-walk2 --object 63 --move 0 -0.9 --name sofa-slide
+.venv-sam3/Scripts/python.exe experiments/01-walkthrough-recon/motion_check.py --motion sofa-slide
+```
+
+The 3D step of replacing an object (TRELLIS.2, `.venv-trellis`, `object_asset.py`) needs Windows patches to three CUDA extensions and access to Meta's gated DINOv3. It isn't documented here until it runs end to end.
+
+## 6. Get the demo footage
 
 The courtyard is [Pexels 10959786](https://www.pexels.com/video/10959786/) ("Showcase of house" by Abdullah, Pexels license). Download the 4K file from that page. The kitchen and house clips (Kindel Media) are fetched by a script:
 
