@@ -4,7 +4,8 @@
 
   1. edit    object_edit.py: Qwen-Image-Edit-2511 replaces it in its best recorded frame; SAM 3 finds the new
              one and cuts it out (ComfyUI must be running)
-  2. 3D      object_asset.py: TRELLIS.2 makes it a 3D object, sampled into splats (.venv-trellis)
+  2. 3D      object_asset.py: TRELLIS.2 makes it a 3D object, sampled into splats (.venv-trellis); then
+             object_splats.py fits the splats to a dense render of its outside, with ambient occlusion
   3. place   object_place.py: posed from its silhouette and depth in the edited frame, coloured to the
              frame's light, swapped in under the same object id, flagged "replaced" -> viewer/<out>
   4. trust   trust_map.py: the new splats show as "replaced" in the viewer's trust view (T)
@@ -53,6 +54,9 @@ def main():
     if args.force or not (d / "asset.pt").exists():
         print("== 3D", flush=True)
         run(py(".venv-trellis"), HERE / "object_asset.py", "--dir", d, "--seed", args.seed)
+    if args.force or not (d / "splats.json").exists():
+        print("== splats", flush=True)
+        run(py(".venv-recon"), HERE / "object_splats.py", "--dir", d)
     print("== place", flush=True)
     run(py(".venv-recon"), HERE / "object_place.py", "--scene", args.scene, "--object", args.object,
         "--asset", d / "asset.pt", "--edit", d / "edit.png", "--mask", d / "edit_mask.png",

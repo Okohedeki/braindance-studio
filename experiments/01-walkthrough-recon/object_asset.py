@@ -177,6 +177,8 @@ def main():
         "up": [0.0, 0.0, 1.0],
     }
     torch.save(asset, args.dir / "asset.pt")
+    for stale in ("asset_sampled.pt", "splats.json"):  # object_splats.py's fit of an earlier asset
+        (args.dir / stale).unlink(missing_ok=True)
 
     vcol = mesh.query_vertex_attrs()[:, lay["base_color"]].clamp(0, 1)
     import trimesh

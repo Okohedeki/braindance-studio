@@ -103,6 +103,9 @@ def main():
     ap.add_argument("--out", help="new viewer package (omit to only fit and report)")
     ap.add_argument("--work")
     ap.add_argument("--self-test", action="store_true", help="refit the old object itself from a random pose")
+    ap.add_argument("--edit-colours", type=float, default=0.0,
+                    help="take the edited frame's own colours where it saw the surface (0-1; off by default: where the "
+                         "edit and the 3D object don't line up exactly, it streaks)")
     args = ap.parse_args()
     torch.manual_seed(0)
 
@@ -128,7 +131,8 @@ def main():
 
     # splats inside the old object's box that never got its id are the old object too: on the courtyard sofa, 186,601
     # generated ones (the walk completion drew it whole) and 6,176 recorded ones the labels missed, against 27,945
-    # labelled. All go, except a layer at the floor.
+    # labelled. All go, except a layer at the floor; generated ones go from a wider shell round it as well (the
+    # completion's guess at the old object spills past its box), and from inside the new object (below).
     flags = (np.frombuffer((src / "inferred.bin").read_bytes(), np.uint8) if (src / "inferred.bin").exists()
              else np.zeros(len(ids), np.uint8))
     box = obj["box"]
@@ -136,7 +140,9 @@ def main():
     local = (xyz - np.array(box["center"])) @ np.array(box["axes"]).T
     o_top = float(torch.quantile(heights, 0.98) - floor)
     above = xyz @ up.cpu().numpy() - float(floor) > 0.08 * o_top
-    ghost = (np.abs(local) <= np.array(box["half"]) * 1.1).all(1) & above & ~old_sel
+    half_old = np.array(box["half"])
+    ghost = (((np.abs(local) <= half_old * 1.1).all(1) | ((np.abs(local) <= half_old * 1.3).all(1) & (flags > 0)))
+             & above & ~old_sel)
     gone = old_sel | ghost
 
     # target: the new object's mask in the edit frame, at mask resolution
@@ -240,6 +246,17 @@ def main():
         inter = (alpha * target).sum()
         return inter / (alpha.sum() + target.sum() - inter + 1e-6)
 
+    # size: no more than 10% longer or taller than what it replaces (the edit was asked for the same size). The edit
+    # frame often cuts the object off at its edge, which leaves its length free: a chesterfield grew to 4.1 m against
+    # the old sofa's 2.35 m and ran through the side table next to it.
+    flat = pts - (pts @ up)[:, None] * up
+    sub = flat[torch.randperm(len(flat), device="cuda")[:50000]]
+    _, _, vh = torch.linalg.svd(sub - sub.mean(0), full_matrices=False)
+    along = sub @ vh[0]
+    a_length = float(torch.quantile(along, 0.99) - torch.quantile(along, 0.01))
+    o_length = 2 * max(obj["box"]["half"][:2])
+    size_cap = min(math.log(1.1 * o_length / a_length), math.log(1.1 * o_height / a_height))
+
     def fit(yaw0, steps, log_s0=math.log(o_height / a_height)):
         yaw = torch.tensor(yaw0, device="cuda", requires_grad=True)
         log_s = torch.tensor(log_s0, device="cuda", requires_grad=True)
@@ -251,6 +268,7 @@ def main():
             _, alpha, d = render(yaw, log_s, off, height, colours, with_depth=True)
             # sharpened: half-transparent splats count as in or out, as they look, not as half an object
             loss = 1 - soft_iou(torch.sigmoid((alpha - 0.5) * 12)) + (height / o_height) ** 2  # on the floor
+            loss = loss + 4 * F.relu(log_s - size_cap) ** 2  # not bigger than what it replaces
             if target_d is not None:
                 m = depth_px & (alpha > 0.5)
                 if m.sum() > 50:
@@ -288,25 +306,32 @@ def main():
     print(f"pose: yaw {math.degrees(float(best['yaw'])) % 360:.0f} deg, scale {math.exp(float(best['log_s'])):.3f}, "
           f"silhouette IoU {best['iou']:.3f} (16 starts: best {max(r['iou'] for r in starts):.3f})", flush=True)
 
-    # colours: per-channel gain and offset fitted to the edited frame where the object shows
-    gain = torch.ones(3, device="cuda", requires_grad=True)
-    bias = torch.zeros(3, device="cuda", requires_grad=True)
-    opt = torch.optim.Adam([gain, bias], lr=0.01)
+    # colours: matched to the edited frame where the object shows, in mean per channel and in contrast (one scale for
+    # all channels). A per-pixel fit against a frame it only roughly lines up with flattened the contrast 2-6x,
+    # washing out the shading the asset carries (object_splats.py's ambient occlusion).
     yaw, log_s, off, height = best["yaw"], best["log_s"], best["off"], best["height"]
-    for _ in range(200):
-        img, alpha = render(yaw, log_s, off, height, (colours * gain + bias).clamp(0, 1))
+    with torch.no_grad():
+        img, alpha = render(yaw, log_s, off, height, colours)
         m = (target > 0.5) & (alpha > 0.5)
+        shrink7 = lambda x: -F.max_pool2d(-x.float()[None, None], 15, stride=1, padding=7)[0, 0] > 0.5
+        mc = shrink7(target > 0.5) & shrink7(alpha > 0.5)  # where they agree: no background in the statistics
+        mc = mc if mc.sum() > 500 else m
+        luma = lambda x: x @ torch.tensor([0.299, 0.587, 0.114], device="cuda")
+        contrast = float((luma(edit_t[mc]).std() / luma(img[mc]).std().clamp(min=1e-4)).clamp(0.5, 2.0))
+        gain = torch.full((3,), contrast, device="cuda")
+        bias = edit_t[mc].mean(0) - contrast * img[mc].mean(0)
+        img, alpha = render(yaw, log_s, off, height, (colours * gain + bias).clamp(0, 1))
         loss = (img[m] - edit_t[m]).abs().mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
     # light: TRELLIS.2 gives albedo, unlit, which looks like a flat cut-out next to a lit scene. Fit one directional
     # light and an ambient term to the edited frame, then, where that frame saw the surface, take its own colours
     # (the detail and light the edit drew), fading to the shaded albedo where the surface turns away from it.
     with torch.no_grad():
         means, quats, _ = place(yaw, log_s, off, height)
-        w_, x_, y_, z_ = F.normalize(quats, dim=1).unbind(1)
-        normals = torch.stack([2 * (x_ * z_ + w_ * y_), 2 * (y_ * z_ - w_ * x_), 1 - 2 * (x_ * x_ + y_ * y_)], 1)
+        if "normals" in asset:  # the mesh's (object_splats.py), turned like the object
+            normals = F.normalize(asset["normals"].to("cuda", torch.float32) @ (rot_about(up.tolist(), yaw) @ A0).T, dim=1)
+        else:  # sampled straight onto the mesh, each disc lies on it: its own axis is the normal
+            w_, x_, y_, z_ = F.normalize(quats, dim=1).unbind(1)
+            normals = torch.stack([2 * (x_ * z_ + w_ * y_), 2 * (y_ * z_ - w_ * x_), 1 - 2 * (x_ * x_ + y_ * y_)], 1)
         cam = torch.linalg.inv(viewmat)[:3, 3]
         to_cam = F.normalize(cam - means, dim=1)
         albedo = (colours * gain + bias).clamp(0, 1)
@@ -335,16 +360,23 @@ def main():
         u = (pc[:, 0] / z * K[0, 0] + K[0, 2]).round().long()
         v = (pc[:, 1] / z * K[1, 1] + K[1, 2]).round().long()
         inside = (pc[:, 2] > 0) & (u >= 0) & (u < tw) & (v >= 0) & (v < th)
-        core = -F.max_pool2d(-target[None, None], 7, stride=1, padding=3)[0, 0] > 0.5  # mask shrunk 3 px
+        # well inside both the edit's mask and the object's own outline (they agree only so far: IoU ~0.85), and only
+        # surfaces facing the frame; colours from a slightly blurred edit. Taken everywhere, misregistered pixels on
+        # curved parts (a rolled arm) streaked the colour into what looked like fur.
+        shrink = lambda m: -F.max_pool2d(-m.float()[None, None], 15, stride=1, padding=7)[0, 0] > 0.5  # 7 px in
+        core = shrink(target > 0.5) & shrink(alpha_o > 0.5)
+        soft = F.avg_pool2d(edit_t.permute(2, 0, 1)[None], 5, stride=1, padding=2)[0].permute(1, 2, 0)
         uc, vc = u.clamp(0, tw - 1), v.clamp(0, th - 1)
-        seen = inside & core[vc, uc] & (alpha_o[vc, uc] > 0.5) & (z <= d_o[vc, uc] * 1.02)
-        facing = ((normals * to_cam).sum(1).abs() - 0.2).div(0.3).clamp(0, 1) * seen.float()
-        new_rgb = facing[:, None] * edit_t[vc, uc] + (1 - facing[:, None]) * rgb
+        seen = inside & core[vc, uc] & (z <= d_o[vc, uc] * 1.02)
+        facing = (((normals * to_cam).sum(1).abs() - 0.5) / 0.3).clamp(0, 1) * seen.float() * args.edit_colours
+        new_rgb = facing[:, None] * soft[vc, uc] + (1 - facing[:, None]) * rgb
         img, alpha = render(yaw, log_s, off, height, new_rgb)
         m = (target > 0.5) & (alpha > 0.5)
         final_l1 = float((img[m] - edit_t[m]).abs().mean())
     report = {"object": args.object, "frame": f["name"], "iou": round(best["iou"], 3),
               "yawDeg": round(math.degrees(float(yaw)) % 360, 1), "scale": round(math.exp(float(log_s)), 4),
+              "sizeVsOld": {"length": round(a_length * math.exp(float(log_s)) / o_length, 3),
+                            "height": round(a_height * math.exp(float(log_s)) / o_height, 3)},
               "colourGain": [round(float(g), 3) for g in gain], "colourBias": [round(float(b), 3) for b in bias],
               "colourL1": round(float(loss), 4), "depthScale": depth_scale,
               "light": {"direction": [round(float(c), 3) for c in F.normalize(light.detach(), dim=0)],
@@ -370,6 +402,16 @@ def main():
         sh0 = ((new_rgb - 0.5) / SH_C0)[:, None]
     m = len(means)
     names = list(cols)
+    # generated splats inside the new object (its box, from the middle 99.6% of its splats) would poke through it
+    pts_new = means.detach().cpu().numpy()
+    c = pts_new.mean(0)
+    _, _, vt = np.linalg.svd(pts_new - c, full_matrices=False)
+    loc_new = (pts_new - c) @ vt.T
+    lo_q, hi_q = np.quantile(loc_new, 0.002, axis=0), np.quantile(loc_new, 0.998, axis=0)
+    inner = (xyz - c) @ vt.T
+    inside_new = ((inner >= lo_q * 1.05) & (inner <= hi_q * 1.05)).all(1) & above & (flags > 0) & ~old_sel
+    report["removed"]["generatedInNew"] = int((inside_new & ~gone).sum())
+    gone = gone | inside_new
     keep = ~gone
     add = {"x": means[:, 0], "y": means[:, 1], "z": means[:, 2], "opacity": asset["opacities"]}
     for i in range(3):
@@ -387,10 +429,7 @@ def main():
     write_ply(out / "scene.ply", new_cols)
     (out / "objects.bin").write_bytes(np.r_[ids[keep], np.full(m, args.object)].astype("<u2").tobytes())
     (out / "inferred.bin").write_bytes(np.r_[flags[keep], np.full(m, 4, np.uint8)].astype(np.uint8).tobytes())
-    pts_new = means.cpu().numpy()
-    c = pts_new.mean(0)
-    u, s_, vt = np.linalg.svd(pts_new - c, full_matrices=False)
-    half = np.abs((pts_new - c) @ vt.T).max(0)
+    half = np.maximum(-lo_q, hi_q)  # the box's centre is the mean, so take the wider side
     for o in listing["objects"]:
         if o["id"] == args.object:
             o["replaced"] = {"was": o["label"], "prompt": args.prompt, "editFrame": f["name"], "place": report,
@@ -402,6 +441,7 @@ def main():
             o["box"] = {"center": c.round(5).tolist(), "axes": vt.round(5).tolist(), "half": half.round(5).tolist()}
             o.pop("rebuilt", None)
     (out / "objects.json").write_text(json.dumps(listing, indent=1))
+    (out_dir / "place.json").write_text(json.dumps(report, indent=1))  # with what the swap removed
     meta["splatCount"] = int(keep.sum()) + m
     meta.pop("coverage", None)
     meta["inferred"] = {**meta.get("inferred", {}), "file": "inferred.bin",

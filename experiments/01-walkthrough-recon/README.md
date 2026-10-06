@@ -705,3 +705,18 @@ Not yet:
 - The replaced object has 400k splats against the old one's 28k: it costs frame rate.
 - The floor under the old object was never recorded. Where the new object is smaller, the gap shows the completion's guess.
 - Replacing from the viewer: the pipeline runs from the command line only.
+
+**Rendering quality of the replaced object** (`object_splats.py`, and fixes to `object_place.py`). Close up, the first chesterfield looked furry and blotchy, with grey patches. Five causes, found one at a time:
+
+| Problem | Cause | Fix |
+|---|---|---|
+| Fur at edges and curves | Discs as wide as the tufting is deep (σ ≈ 8 mm), on a surface that curves faster than that | Fit the 400k splats to renders of a dense 3M-disc reference of the mesh from views all round: held out against the reference, 28.8 → 54.8 dB |
+| Speckles, wasted splats | 45% of TRELLIS.2's surface is inside the object (faces between cushions and in the frame), sampled as densely as the outside | Keep only surface seen from some direction outside (256 directions, depth maps of the discs themselves) |
+| Flat look | The albedo is unlit | Ambient occlusion from 128 sky directions, smoothed ~1 cm, baked into the colours |
+| Blotches | Mesh faces aren't wound consistently: about half the normals point inward and got no light; the fit also turns discs freely, so their axes stop being normals | Normals turned towards where each point is seen from, smoothed, saved with the asset |
+| Contrast squashed 2–6× | Per-pixel colour fit against an edit it only roughly lines up with | Match mean per channel and contrast (capped at 2×) where edit and object agree |
+| Streaks | Copying the edit's pixels onto a surface misaligned with them | Off by default (`--edit-colours`) |
+| Grey patches | The completion's guess at the old sofa spilled past its box | Generated splats removed from a 1.3× shell and from inside the new object |
+| 4.1 m long sofa, through the side table | The edit cut the sofa off at the frame edge, so its length was free; a worse local optimum | Size capped softly at 1.1× the old object: the fit finds IoU 0.874 (was 0.850), 2.75 m by 0.70 m |
+
+The splat count is unchanged (400k), so frame rate is unchanged. The fit takes under a minute. The lower chesterfield now uncovers background the old sofa hid, which was never recorded.
