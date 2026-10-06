@@ -687,3 +687,21 @@ What doesn't work yet:
 - Where the camera pans onto what the first frame doesn't show, LTX invents it: a pool, a palm, an extra armchair. Keyframes from the recording would fix the background, but they also show the object where it was.
 - The 40° turn shrank the sofa to a two-seater.
 - With the viewer's GPU worker holding Difix (about 5 GB), LTX's text encoder didn't fit beside it. Windows spilled VRAM into system memory, and the encode step crawled for 10 minutes before it was stopped. Now the worker moves Difix to system memory while a viewer job runs (`work/gpu_busy.json`).
+
+## V2: replacing an object from a prompt
+
+`replace_object.py --scene courtyard-walk2 --object 63 --prompt "a deep green velvet chesterfield sofa ..."`, step by step:
+
+1. **Edit** (`object_edit.py`). Qwen-Image-Edit-2511 in ComfyUI redraws the sofa in its best recorded frame (a crop 2.2× its mask), told to keep the place, size, angle and light. SAM 3 finds the new sofa in the edit (overlap with the old one: best instance kept) and cuts it out. About 2 minutes. On a 24 GB card ComfyUI needs `--disable-dynamic-vram --disable-smart-memory`; dynamic VRAM was about 5× slower.
+2. **3D** (`object_asset.py`, TRELLIS.2-4B, 1024 cascade). 126 s to generate; loading took 285 s the first time. The result is a 7.3M-face mesh with a voxel volume of PBR attributes, sampled into 400k flat splats on the surface. Two blockers had to be worked around:
+   - **DINOv3 is gated.** TRELLIS.2's image encoder needs Meta's approval. timm's ungated copy of the same weights is converted to transformers' layout (`dinov3_from_timm.py`), and the converted model matches timm to a relative 5.7e-7 on all 1,029 tokens. transformers 5 also moved the blocks (`model.model.layer`), which TRELLIS.2's extractor didn't expect.
+   - **Windows builds.** FlexGEMM and o-voxel needed small fixes (`patches/`). CuMesh and nvdiffrast are stubbed, since image-to-3D doesn't need them.
+3. **Place** (`object_place.py`). The asset is posed by its silhouette in the edited frame, starting from 16 yaws and four sizes, with MoGe-2 depth to scale: IoU 0.85.
+   - **Light.** TRELLIS.2's colours are albedo, unlit, and looked like a flat cut-out. A directional light plus ambient is fitted to the edited frame. Where that frame saw the surface (6% of splats, facing it, in front of the asset's own depth), its colours are taken directly, fading out at grazing angles. L1 in that frame: 0.080 → 0.032.
+   - **The old sofa wasn't just its label.** Removing object 63's 27,945 splats left grey cushions poking through the new seat. Inside the old box were 186,601 completed splats (the walk completion drew the sofa whole, unlabelled) and 6,176 recorded ones the labels had missed. Everything unlabelled inside the box goes now, except a layer at the floor.
+4. **Trust and review.** The new splats are flagged 4, "replaced", in the trust view, and the object's old attributes move into its replacement record. In the review from the recorded cameras (`work/courtyard/objects/replace/63/review.jpg`), the chesterfield sits where the sofa was, tufted and lit like the scene. Its back is plain green; the edit never showed it.
+
+Not yet:
+- The replaced object has 400k splats against the old one's 28k: it costs frame rate.
+- The floor under the old object was never recorded. Where the new object is smaller, the gap shows the completion's guess.
+- Replacing from the viewer: the pipeline runs from the command line only.

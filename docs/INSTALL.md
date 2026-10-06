@@ -194,9 +194,9 @@ The rebuild, completion and walk stages send their jobs to a local [ComfyUI](htt
 
 LTX uses most of a 24 GB card. Stop the GPU render worker while generating; the scripts unload ComfyUI's models before each fit. (Jobs started from the viewer, such as filming a move, don't need that: the worker moves Difix off the GPU while they run.)
 
-## 5. Tracking, motion edits and the 2D replace step (V2)
+## 5. Tracking, motion edits and object replacement (V2)
 
-These set up point tracking (TAPNext++), filming a move from the viewer, and the 2D step of replacing an object from a prompt. They aren't in `install.sh` yet.
+These set up point tracking (TAPNext++), filming a move from the viewer, and replacing an object from a prompt. They aren't in `install.sh` yet.
 
 1. **TAPNext++** runs in `.venv-sam3`, from DeepMind's repository:
 
@@ -233,7 +233,42 @@ Then, in the viewer (served by `serve.py`): select an object, move or turn it, a
 .venv-sam3/Scripts/python.exe experiments/01-walkthrough-recon/motion_check.py --motion sofa-slide
 ```
 
-The 3D step of replacing an object (TRELLIS.2, `.venv-trellis`, `object_asset.py`) needs Windows patches to three CUDA extensions and access to Meta's gated DINOv3. It isn't documented here until it runs end to end.
+### Replacing an object: the 3D step (TRELLIS.2, `.venv-trellis`)
+
+`object_asset.py` turns the edited object into 3D with [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) in its own environment (Python 3.10, PyTorch 2.6 + CUDA 12.4). Two of its CUDA extensions need small Windows fixes, saved in `experiments/01-walkthrough-recon/patches/`. Build with Visual Studio 2019 Build Tools and the CUDA 12.6 toolkit, from an x64 developer prompt (`tools/ext/build_trellis.bat` is the script used).
+
+```bash
+uv venv --python 3.10 .venv-trellis
+uv pip install --python .venv-trellis/Scripts/python.exe torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+uv pip install --python .venv-trellis/Scripts/python.exe xformers==0.0.29.post3 transformers==5.18.0 timm==1.0.30 \
+  easydict==1.13 kornia==0.8.2 opencv-python-headless==5.0.0.93 plyfile==1.1.5 trimesh==5.1.1 utils3d==0.0.2 \
+  imageio==2.38.0 imageio-ffmpeg==0.6.0 accelerate==1.15.0 scipy==1.15.3
+git clone https://github.com/microsoft/TRELLIS.2.git tools/TRELLIS.2 && git -C tools/TRELLIS.2 checkout 75fbf01
+git -C tools/TRELLIS.2 apply ../../experiments/01-walkthrough-recon/patches/o-voxel-windows.patch
+git clone https://github.com/JeffreyXiang/FlexGEMM.git tools/ext/FlexGEMM && git -C tools/ext/FlexGEMM checkout 6dd94a8
+git -C tools/ext/FlexGEMM apply ../../../experiments/01-walkthrough-recon/patches/flexgemm-windows.patch
+# then, in a VS 2019 x64 prompt with CUDA_HOME set to CUDA 12.6, TORCH_CUDA_ARCH_LIST=8.9 (your GPU), DISTUTILS_USE_SDK=1:
+uv pip install --python .venv-trellis/Scripts/python.exe --no-build-isolation tools/ext/FlexGEMM
+uv pip install --python .venv-trellis/Scripts/python.exe --no-build-isolation --no-deps tools/TRELLIS.2/o-voxel
+```
+
+What the patches fix: MSVC rejects `data_ptr<T>()` on a dependent type in FlexGEMM (now `reinterpret_cast<T*>(data_ptr())`), and o-voxel uses GCC's `1e-6d` literals and narrowing brace-initialisers (now plain literals and `int64_t` casts). `--no-deps` stops o-voxel's install from rebuilding FlexGEMM from git without the fix. Two more pieces aren't built at all. CuMesh doesn't compile with MSVC 2019 (its `::cuda` clashes with PyTorch's `c10::cuda`); image-to-3D only uses it to fill small holes, so `object_asset.py` stands in for it. nvdiffrast is only used for GLB baking and texturing, so it's stubbed the same way.
+
+Models (in the project's HF cache, `tools/hf`):
+- **TRELLIS.2:** `microsoft/TRELLIS.2-4B` (14 GB), plus the sparse-structure decoder it borrows from `microsoft/TRELLIS-image-large`. Both download on first run.
+- **DINOv3 ViT-L/16, TRELLIS.2's image encoder:** `facebook/dinov3-vitl16-pretrain-lvd1689m` is gated, and Meta approves access by hand. Without access, convert timm's ungated copy of the same weights (1.2 GB) once. The script checks the result against timm before saving it to `tools/models/dinov3-vitl16-lvd1689m/`, and `object_asset.py` uses it when the gated repository isn't accessible:
+
+  ```bash
+  .venv-trellis/Scripts/python.exe experiments/01-walkthrough-recon/dinov3_from_timm.py
+  ```
+
+Then the whole replacement runs in one command (ComfyUI running, for the edit step):
+
+```bash
+python experiments/01-walkthrough-recon/replace_object.py --scene courtyard-walk2 --object 63 --kind sofa --label sofa --prompt "a deep green velvet chesterfield sofa with tufted cushions, rolled arms and dark walnut legs"
+```
+
+It writes `viewer/<scene>-replace<id>/`. On a 4090: edit about 2 minutes, TRELLIS.2 about 2 minutes (plus 5 to load the first time), placement under a minute. TRELLIS.2 needs most of the card: stop the GPU render worker first, or create `experiments/01-walkthrough-recon/work/gpu_busy.json` (any content) so the worker moves Difix to system memory until you delete it.
 
 ## 6. Get the demo footage
 
