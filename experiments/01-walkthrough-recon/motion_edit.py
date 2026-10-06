@@ -3,22 +3,25 @@ that are worked out in 3D (Motion-Track-Control IC-LoRA).
 
   python motion_edit.py --scene courtyard-walk2 --object 63 --move 1.2 0 --name sofa-slide
   python motion_edit.py --scene courtyard-walk2 --object 63 --turn 35 --name sofa-turn
+  python motion_edit.py --scene courtyard-walk2 --object 63 --transform <16 numbers> --name ...   (the viewer)
 
   1. picks --seconds of the recording where the object stays in view where it is and where it goes (or
      --start), with a camera for every frame at 24 fps, interpolated between the recorded frames
   2. tracks: points triangulated from TAPNext++ tracks (track_triangulate.py) that the recording saw
      throughout, projected through those cameras, so the camera moves as it really did; and points on the
      object's surface (its splats, those in view in the first frame), moved by --move (metres along its long
-     and short sides, on the floor) and --turn (degrees about the vertical), eased in and out, projected the
-     same way. A background point stops where the moved object would hide it.
+     and short sides, on the floor) and --turn (degrees about the vertical), or to the pose --transform gives
+     (the viewer's edit: a 4x4 row-major matrix in the scene's frame), eased in and out, projected the same
+     way. A background point stops where the moved object would hide it.
   3. LTX-2.3 22B distilled with the Motion-Track-Control IC-LoRA in the local ComfyUI: the recorded first
      frame, the tracks drawn as its guide (LTXVDrawTracks), and the prompt
   4. writes work/<work>/motion/<name>/: tracks.json, tracks.jpg, recorded/ (the recording over the same
      stretch, frame for frame), frames/, edit.mp4, compare.mp4 (recording, edit, edit with the tracks it was
      asked to follow), motion.json
 
-Then motion_check.py measures how closely the generated clip followed the tracks. Run with the reconstruction
-environment; ComfyUI must be running.
+Then motion_check.py measures how closely the generated clip followed the tracks. Prints PROGRESS lines for
+viewer/serve.py. Run with the reconstruction environment; ComfyUI must be running (comfy_client.ensure_running
+starts it if it can).
 """
 
 import argparse
@@ -45,6 +48,10 @@ from track_check import depth, load_scene  # noqa: E402
 W, H, FPS = 1024, 576, 24
 NEGATIVE = ("pc game, console game, video game, cartoon, childish, ugly, blurry, distorted furniture, objects "
             "melting, flicker, camera shake, text, watermark")
+
+
+def progress(stage, message):
+    print("PROGRESS " + json.dumps({"stage": stage, "message": message}), flush=True)
 
 
 def cameras(frames, t0, n):
@@ -101,6 +108,8 @@ def main():
     ap.add_argument("--move", type=float, nargs=2, default=[0.0, 0.0],
                     help="metres along the object's long side and its short side, on the floor")
     ap.add_argument("--turn", type=float, default=0.0, help="degrees about the vertical, through its centre")
+    ap.add_argument("--transform", type=float, nargs=16,
+                    help="the object's new pose instead: 4x4 row-major in the scene's frame (the viewer's edit)")
     ap.add_argument("--start", type=float, help="seconds into the recording (default: where it stays in view)")
     ap.add_argument("--seconds", type=float, default=4.0)
     ap.add_argument("--prompt", help="what happens (default: the object slides across the floor by itself)")
@@ -135,20 +144,29 @@ def main():
         im = im.resize((round(f["width"] * s), round(f["height"] * s)), Image.LANCZOS)
         return im.crop((round(ox), round(oy), round(ox) + W, round(oy) + H)), f
 
-    # the move: about the box centre, on the floor
+    # the move, as a rigid transform M of the object: its centre travels in a straight line while it turns
+    progress("plan", "Choosing the stretch of the recording")
     box = obj["box"]
     centre = np.array(box["center"])
     axes = np.array(box["axes"])
     up = np.array(meta["worldUp"]) / np.linalg.norm(meta["worldUp"])
-    flat = [a - up * (a @ up) for a in axes[:2]]
-    order = np.argsort(-np.array(box["half"][:2]))
-    long_ax, short_ax = (flat[k] / np.linalg.norm(flat[k]) for k in order)
-    shift = (args.move[0] * long_ax + args.move[1] * short_ax) / mpu
+    if args.transform:
+        M = np.array(args.transform).reshape(4, 4)
+    else:
+        flat = [a - up * (a @ up) for a in axes[:2]]
+        order = np.argsort(-np.array(box["half"][:2]))
+        long_ax, short_ax = (flat[k] / np.linalg.norm(flat[k]) for k in order)
+        M = np.eye(4)
+        M[:3, :3] = Rotation.from_rotvec(math.radians(args.turn) * up).as_matrix()
+        M[:3, 3] = centre - M[:3, :3] @ centre + (args.move[0] * long_ax + args.move[1] * short_ax) / mpu
+    R_end, t_end = M[:3, :3], M[:3, 3]
+    shift = R_end @ centre + t_end - centre  # how far the centre goes
+    turn = Rotation.from_matrix(R_end).as_rotvec()
     e = ease(n)
 
     def moved(X):
         """X [P, 3] -> [n, P, 3] as the object moves."""
-        R = Rotation.from_rotvec(np.outer(e * math.radians(args.turn), up)).as_matrix()  # [n, 3, 3]
+        R = Rotation.from_rotvec(np.outer(e, turn)).as_matrix()  # [n, 3, 3]
         return np.einsum("nij,pj->npi", R, X - centre) + centre + e[:, None, None] * shift
 
     def project_moving(Xn, c2w):
@@ -182,6 +200,7 @@ def main():
         recorded_image(t)[0].save(rec / f"{j:04d}.jpg", quality=92)
 
     # 2a. object points: its splats in view in the first frame, spread across it
+    progress("tracks", f"Working out tracks from {args.start:.1f} s")
     cols = read_ply(src / "scene.ply")
     ids = np.frombuffer((src / "objects.bin").read_bytes(), "<u2")
     sel = (ids == args.object) & (1 / (1 + np.exp(-cols["opacity"])) > 0.8)
@@ -214,8 +233,7 @@ def main():
     # away from the object where it is and where it goes
     local = (X_bg - centre) @ axes.T
     near = (np.abs(local) < np.array(box["half"]) * 1.5).all(1)
-    endpos = np.einsum("ij,pj->pi", Rotation.from_rotvec(-math.radians(args.turn) * up).as_matrix(),
-                       X_bg - centre - shift) @ axes.T  # in the moved box's own frame
+    endpos = ((X_bg - t_end) @ R_end - centre) @ axes.T  # in the moved box's own frame
     near |= (np.abs(endpos) < np.array(box["half"]) * 1.5).all(1)
     keep = (inside.mean(0) > 0.9) & ~near
     X_bg, bg_xy, bg_z = X_bg[keep], bg_xy[:, keep], bg_z[:, keep]
@@ -248,13 +266,18 @@ def main():
         cv2.circle(prev, tuple(int(c) for c in p[-1]), 4, (255, 255, 255), -1)
     Image.fromarray(prev).save(out / "tracks.jpg", quality=90)
 
-    prompt = args.prompt or (f"A slow handheld shot walking through a sunlit courtyard terrace. The {obj['label']} "
-                             f"glides smoothly across the floor on its own, as if pushed by an invisible hand, "
-                             f"staying upright and keeping its shape. Everything else stays still. Natural light, "
-                             f"realistic, detailed.")
+    metres, degrees = float(np.linalg.norm(shift) * mpu), float(np.degrees(np.linalg.norm(turn)))
+    captions = sorted((work / "complete").glob("p*/caption.txt"))  # scene_caption.py: what the place is
+    place = captions[0].read_text().strip() if captions else ""
+    does = ("glides smoothly across the floor while slowly turning" if metres > 0.1 and degrees > 5
+            else "slowly turns in place" if degrees > 5 else "glides smoothly across the floor")
+    prompt = args.prompt or (f"A slow handheld shot. {place} The {obj['label']} {does} on its own, as if moved by "
+                             f"an invisible hand, staying upright and keeping its shape. Everything else stays "
+                             f"still. Natural light, realistic, detailed.").replace("  ", " ")
     report = {"scene": args.scene, "object": args.object, "label": obj["label"], "start": round(args.start, 2),
               "seconds": args.seconds, "frames": n, "fps": FPS, "firstFrame": f_first["name"],
-              "move": args.move, "turn": args.turn, "moveSceneUnits": shift.tolist(), "prompt": prompt,
+              "transform": M.tolist(), "moveMetres": round(metres, 2), "turnDegrees": round(degrees, 1),
+              "moveSceneUnits": shift.tolist(), "prompt": prompt,
               "objectPoints": len(X_obj), "backgroundPoints": groups.count("background"),
               "objectTravelPx": round(float(np.median(travel)), 1), "seed": args.seed,
               "guideStrength": args.guide_strength, "K": K.tolist(), "c2w": c2w.tolist()}
@@ -264,8 +287,9 @@ def main():
         return
 
     # 3. generate
-    if not comfy_client.ready():
-        raise SystemExit("ComfyUI isn't running on " + comfy_client.COMFY)
+    progress("start", "Starting ComfyUI")
+    comfy_client.ensure_running()
+    progress("generate", f"LTX-2.3 is generating {n} frames (about 9 minutes)")
     t0 = time.time()
     graph = comfy_client.ltx_motion_graph(prompt, NEGATIVE, json.dumps(tracks), comfy_client.upload(str(out / "first.png")),
                                           n, W, H, FPS, f"braindance/motion_{args.name}",
@@ -281,6 +305,7 @@ def main():
     report["generateMinutes"] = round((time.time() - t0) / 60, 1)
 
     # 4. videos: the edit, and recording | edit | edit with its tracks
+    progress("videos", "Writing the videos")
     gen = sorted((out / "frames").glob("*.png"))
     ff = ["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(FPS)]
     subprocess.run(ff + ["-i", str(out / "frames" / "%04d.png"), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",

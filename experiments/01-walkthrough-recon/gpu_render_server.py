@@ -34,6 +34,12 @@ Protocol
 Only the newest request per connection is rendered: requests that arrive while
 a frame is rendering replace each other, so a moving camera never queues up
 stale work.
+
+While work/gpu_busy.json exists (viewer/serve.py writes it for a film or a scan),
+the worker gives the GPU way: Difix moves to system memory, the cache is freed
+and still views aren't sharpened; renders carry on. LTX-2.3 and Difix together
+don't fit in 24 GB, and over-committed VRAM on Windows spills into system memory
+and crawls rather than failing.
 """
 
 import argparse
@@ -60,6 +66,7 @@ SHARPEN_MAX_WIDTH = 1280  # Difix runs at most this wide; the result is resized 
 SHARPEN_MIN_RECORDED = 0.5  # sharpen only views mostly of recorded surfaces: elsewhere Difix invents (a garden -> a wall)
 SCENE_NAME = re.compile(r"^[A-Za-z0-9_-]+$")
 MAX_SIZE = 4096
+BUSY = VIEWER.parent / "work" / "gpu_busy.json"
 SH_C0 = 0.28209479177387814  # degree-0 spherical harmonic: colour = 0.5 + SH_C0 * dc
 INFERRED_TINT = (0.72, 0.45, 1.0)  # violet: guessed, not recorded
 # trust_map.py classes and their colours in the trust view
@@ -330,6 +337,18 @@ class Renderer:
         self.max_scenes = max_scenes
         self.difix = None  # Difix pipeline, loaded in the background (load_difix)
         self.difix_error = None
+        self.yielded = False  # Difix moved off the GPU for a viewer job (BUSY)
+
+    def give_way(self):
+        """Follow BUSY: move Difix off the GPU while another job needs it, back after. Runs in the render queue."""
+        busy = BUSY.exists()
+        if busy == self.yielded or self.difix is None:
+            return
+        self.difix.to("cpu" if busy else "cuda")
+        self.yielded = busy
+        torch.cuda.empty_cache()
+        print("GPU busy with a viewer job: Difix moved to system memory" if busy
+              else "GPU free again: Difix back on the GPU", flush=True)
 
     def load_difix(self):
         try:
@@ -350,6 +369,8 @@ class Renderer:
         from PIL import Image
         if self.difix is None:
             return img, {"skipped": self.difix_error or "Difix is still loading"}
+        if self.yielded:
+            return img, {"skipped": "the GPU is busy with a film or a scan"}
         if s.load_trust() is not None:
             small = K.clone()
             small[:2] /= 8
@@ -389,6 +410,7 @@ class Renderer:
         return self.scenes[name]
 
     def render(self, req):
+        self.give_way()
         s = self.scene(str(req["scene"]))
         w, h = int(req["width"]), int(req["height"])
         if not (0 < w <= MAX_SIZE and 0 < h <= MAX_SIZE):
@@ -444,6 +466,16 @@ async def main():
     hello = json.dumps({"type": "hello", "backend": f"gsplat {gsplat_version}",
                         "device": torch.cuda.get_device_name(0), "capabilities": ["render", "objects", "inferred", "trust", "edits", "sharpen"]})
     loop = asyncio.get_running_loop()
+
+    async def watch_busy():  # also when nobody is rendering
+        while True:
+            try:
+                await loop.run_in_executor(pool, renderer.give_way)
+            except Exception as e:
+                print(f"give_way failed: {e}", flush=True)
+            await asyncio.sleep(2)
+
+    asyncio.create_task(watch_busy())
 
     async def handler(ws):
         await ws.send(hello)

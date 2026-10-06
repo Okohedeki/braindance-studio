@@ -9,6 +9,7 @@ Env: COMFY_URL (default http://127.0.0.1:8188). Standard library only.
 
 import json
 import os
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -37,6 +38,38 @@ def ready():
         return True
     except OSError:
         return False
+
+
+COMFY_DIR = os.environ.get("COMFY_DIR", r"D:\ai\ComfyUI")
+
+
+def ensure_running(timeout=240):
+    """Start the local ComfyUI if it isn't up (detached, so it stays for the next job), and wait for it.
+
+    The flags are the ones that work on a 24 GB card next to other GPU work: no dynamic VRAM (it ran ~5x
+    slower), no smart memory (models leave the GPU after each job). COMFY_RESERVE_VRAM (GB, default 1.5)
+    leaves room for e.g. the viewer's GPU worker."""
+    if ready():
+        return
+    py = os.path.join(COMFY_DIR, "venv", "Scripts" if os.name == "nt" else "bin", "python.exe" if os.name == "nt" else "python")
+    if not os.path.exists(py):
+        raise SystemExit(f"ComfyUI isn't running on {COMFY} and isn't installed at {COMFY_DIR} (set COMFY_DIR)")
+    port = urllib.parse.urlparse(COMFY).port or 8188
+    env = {k: v for k, v in os.environ.items() if k not in ("__PYVENV_LAUNCHER__", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")}
+    env["PYTHONUTF8"] = "1"
+    log = open(os.path.join(COMFY_DIR, "user", "braindance_comfyui.log"), "ab")
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    subprocess.Popen([py, "main.py", "--listen", "127.0.0.1", "--port", str(port),
+                      "--reserve-vram", os.environ.get("COMFY_RESERVE_VRAM", "1.5"),
+                      "--disable-dynamic-vram", "--disable-smart-memory"],
+                     cwd=COMFY_DIR, env=env, stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+                     creationflags=flags, start_new_session=os.name != "nt")
+    t0 = time.time()
+    while not ready():
+        if time.time() - t0 > timeout:
+            raise SystemExit(f"started ComfyUI, but it didn't answer on {COMFY} within {timeout} s "
+                             f"(see {COMFY_DIR}\\user\\braindance_comfyui.log)")
+        time.sleep(2)
 
 
 def free():

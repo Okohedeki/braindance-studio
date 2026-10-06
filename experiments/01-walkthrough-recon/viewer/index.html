@@ -109,8 +109,24 @@
   #inset .frame { position: relative; }
   #insetMask { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 
+  #editFilm { width: 100%; border-color: var(--cyan); color: var(--cyan); }
+  #editFilm:disabled { border-color: var(--line); color: var(--muted); opacity: .6; cursor: default; background: transparent; }
+  #filmWatch { justify-self: start; padding: 3px 10px; font-size: 12px; }
+  #filmPanel { position: absolute; left: calc(220px + 2 * var(--space-3)); right: var(--space-3); bottom: 44px; z-index: 3;
+    max-width: 960px; margin: 0 auto; background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); overflow: hidden; box-shadow: 0 8px 32px rgba(0, 0, 0, .5); }
+  #filmPanel .bar { display: flex; align-items: center; gap: var(--space-2); padding: 6px var(--space-2); }
+  #filmPanel .bar h2 { flex: 1; min-width: 0; margin: 0; font-size: 12px; font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #filmPanel .seg { grid-template-columns: repeat(3, auto); }
+  #filmPanel .seg button { padding: 3px 10px; font-size: 12px; }
+  #filmPanel .bar > button { padding: 3px 8px; }
+  #filmPanel video { display: block; width: 100%; max-height: 62vh; background: #000; }
+  #filmPanel figcaption { padding: 6px var(--space-2); color: var(--muted); font-size: 12px; }
+
   @media (max-width: 720px) {
     #panel { width: auto; right: var(--space-3); top: auto; bottom: var(--space-3); grid-template-columns: 1fr 1fr; }
+    #filmPanel { left: var(--space-3); top: var(--space-3); bottom: auto; }
     #inset { width: 44vw; }
     #timecode { min-width: 0; }
   }
@@ -189,8 +205,11 @@
           <button id="editLeft" title="Slide it to your left">Left</button>
           <button id="editRight" title="Slide it to your right">Right</button>
         </div>
+        <button id="editFilm" hidden>Film this move</button>
         <p class="hint" id="editHint"></p>
       </div>
+      <p class="hint" id="filmHint" aria-live="polite" hidden></p>
+      <button id="filmWatch" hidden>Watch the last film</button>
       <form id="scanForm" hidden>
         <input id="scanPrompt" type="text" maxlength="40" autocomplete="off" placeholder="Scan for… (e.g. lamp)" aria-label="Object to scan for">
         <button type="submit" id="scanBtn">Scan</button>
@@ -202,6 +221,20 @@
   <figure id="inset">
     <div class="frame"><img id="frameImg" alt="Recorded video frame at the current time"><canvas id="insetMask" hidden aria-hidden="true"></canvas></div>
     <figcaption><span class="badge recorded">Recorded</span><span class="num" id="frameLabel"></span><span id="heldOut">held out of training</span></figcaption>
+  </figure>
+
+  <figure id="filmPanel" hidden aria-labelledby="filmTitle">
+    <div class="bar">
+      <h2 id="filmTitle"></h2>
+      <div class="seg" role="group" aria-label="Which video">
+        <button id="filmShowCompare" aria-pressed="true" title="The recording, the edit, and the edit with the tracks it was given">Side by side</button>
+        <button id="filmShowEdit" aria-pressed="false" title="The edit alone">Edit</button>
+        <button id="filmShowCheck" aria-pressed="false" title="The tracks it was given (colour) and where TAPNext++ found those points (white)">Check</button>
+      </div>
+      <button id="filmClose" aria-label="Close the film">✕</button>
+    </div>
+    <video id="filmVideo" controls autoplay loop muted playsinline></video>
+    <figcaption id="filmCaption"></figcaption>
   </figure>
 
   <div id="toast" role="status"></div>
@@ -950,6 +983,7 @@ function updateObjectsHint() {
 const SCENE_UP = new THREE.Vector3(...meta.worldUp).normalize();
 objects.edits = new Map();
 objects.editVersion = 0;
+const filmUI = { available: false, wasRunning: false, state: null, last: null, error: "", show: "compare.mp4" };
 function editMatrix(o, e) {
   const c = new THREE.Vector3(...o.box.center);
   return new THREE.Matrix4().makeTranslation(c.x + e.offset.x, c.y + e.offset.y, c.z + e.offset.z)
@@ -1002,6 +1036,7 @@ function updateEditUI() {
   $("editHint").textContent = !gpuActive() ? "Editing objects needs the GPU renderer."
     : `${edited ? `${edited} object${edited > 1 ? "s" : ""} edited (not saved). ` : ""}`
       + "What was behind it was never recorded: moving it uncovers a hole or an estimate (T shows which).";
+  updateFilmUI();
 }
 $("editRemove").onclick = () => editFocused((e) => { e.hide = !e.hide; });
 $("editTurnL").onclick = () => editFocused((e) => { e.yaw += 15; });
@@ -1168,7 +1203,119 @@ $("scanForm").onsubmit = async (e) => {
   pollScan();
 };
 
+// Filming a move (served by serve.py): LTX-2.3 makes the picked object's edit
+// happen in the recording, steered by point tracks worked out in 3D
+// (motion_edit.py); TAPNext++ then checks how closely it followed them.
+const FILM_STEPS = ["plan", "tracks", "start", "generate", "videos", "check"];
+function filmMovable(o) {
+  const e = o && objects.edits.get(o.id);
+  return !!e && !e.hide && (e.yaw !== 0 || e.offset.lengthSq() > 0);
+}
+function updateFilmUI() {
+  const o = objects.byId.get(objects.focus);
+  const running = filmUI.state?.state === "running";
+  const btn = $("editFilm");
+  btn.hidden = !filmUI.available;
+  btn.disabled = running || !filmMovable(o);
+  btn.title = running ? "Already filming a move; one at a time"
+    : !filmMovable(o) ? "Move or turn it first, then film the move"
+    : "Make a video of this move happening in the recording: LTX-2.3, steered by tracks worked out in 3D (about 10 minutes)";
+}
+async function pollFilm() {
+  let st;
+  try {
+    const res = await fetch("/__film");
+    if (!res.ok) throw new Error(res.status);
+    st = await res.json();
+  } catch {
+    filmUI.available = false;
+    updateFilmUI();
+    return;
+  }
+  filmUI.available = true;
+  filmUI.state = st;
+  const running = st.state === "running";
+  let hint = filmUI.error;
+  if (running) {
+    const secs = Math.max(0, Math.round(Date.now() / 1000 - st.started));
+    const k = FILM_STEPS.indexOf(st.stage);
+    const label = objects.byId.get(st.object)?.label ?? "object";
+    hint = `Filming the ${label}: ${st.message}${k >= 0 ? ` (step ${k + 1} of ${FILM_STEPS.length})` : ""}`
+      + ` · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+    setTimeout(pollFilm, 2000);
+  } else if (filmUI.wasRunning && st.state === "failed") {
+    hint = filmUI.error = `Filming failed: ${st.message}`;
+  } else if (st.state === "done" && st.scene === sceneName) {
+    filmUI.last = st;
+    if (filmUI.wasRunning) openFilm(st);
+  }
+  $("filmHint").textContent = hint;
+  $("filmHint").hidden = !hint;
+  $("filmWatch").hidden = !filmUI.last || running || !$("filmPanel").hidden;
+  filmUI.wasRunning = running;
+  updateFilmUI();
+}
+function openFilm(st) {
+  const did = [st.metres >= 0.05 ? `moved ${st.metres.toFixed(1)} m` : "", st.degrees >= 1 ? `turned ${Math.round(st.degrees)}°` : ""]
+    .filter(Boolean).join(" and ") || "moved";
+  $("filmTitle").textContent = `The ${st.label} ${did} · ${st.seconds} s of the recording, made in ${st.minutes} min`;
+  const c = st.check;
+  $("filmCaption").textContent = c
+    ? `Checked with TAPNext++: the ${st.label}'s points stayed within ${c.objectPx} px of their paths (median) and `
+      + `${Math.round(c.moved * 100)}% ended nearer the new place than the old; the background, so the camera, within `
+      + `${c.cameraPx} px. Anything the first frame doesn't show is the video model's guess.`
+    : "";
+  showFilm(filmUI.show);
+  $("filmPanel").hidden = false;
+  $("filmWatch").hidden = true;
+}
+function showFilm(file) {
+  const st = filmUI.last;
+  if (!st.files?.includes(file)) file = "edit.mp4";
+  filmUI.show = file;
+  for (const [id, f] of [["filmShowCompare", "compare.mp4"], ["filmShowEdit", "edit.mp4"], ["filmShowCheck", "check.mp4"]]) {
+    $(id).setAttribute("aria-pressed", String(f === file));
+    $(id).hidden = !st.files?.includes(f);
+  }
+  $("filmVideo").src = `/__film/${st.name}/${file}`;
+}
+function closeFilm() {
+  $("filmPanel").hidden = true;
+  $("filmVideo").pause();
+  $("filmWatch").hidden = !filmUI.last;
+}
+$("editFilm").onclick = async () => {
+  const o = objects.byId.get(objects.focus);
+  const matrix = filmMovable(o) && editsRequest()?.[o.id]?.matrix;
+  if (!matrix) return;
+  let res, body = {};
+  try {
+    res = await fetch("/__film", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scene: sceneName, object: o.id, matrix }) });
+    body = await res.json().catch(() => ({}));
+  } catch (err) {
+    body.error = `Could not start filming: ${err.message}`;
+  }
+  if (!res?.ok) {
+    filmUI.error = body.error || `Could not start filming (${res.status}).`;
+    $("filmHint").textContent = filmUI.error;
+    $("filmHint").hidden = false;
+    return;
+  }
+  filmUI.error = "";
+  filmUI.wasRunning = true;
+  closeFilm();
+  pollFilm();
+};
+$("filmWatch").onclick = () => filmUI.last && openFilm(filmUI.last);
+$("filmClose").onclick = closeFilm;
+$("filmShowCompare").onclick = () => showFilm("compare.mp4");
+$("filmShowEdit").onclick = () => showFilm("edit.mp4");
+$("filmShowCheck").onclick = () => showFilm("check.mp4");
+
 window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLVideoElement) return;  // the film's own controls
+  if (e.key === "Escape" && !$("filmPanel").hidden) { closeFilm(); return; }
   if (e.target instanceof HTMLInputElement && e.target.type === "text") return;  // typing a scan prompt
   if (e.target instanceof HTMLInputElement && e.target.type === "checkbox" && e.key === " ") return;
   const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
@@ -1217,6 +1364,7 @@ updateRendererUI();
 connectWorker();
 loadObjects();
 pollScan();
+pollFilm();
 
 renderer.setAnimationLoop((now) => {
   const dt = Math.min(0.1, (now - last) / 1000);
