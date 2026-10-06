@@ -26,7 +26,7 @@ def look_at(eye, target, up):
     """Camera-to-world (COLMAP axes: +z forward, +y down) looking from eye at target."""
     fwd = target - eye
     fwd = fwd / np.linalg.norm(fwd)
-    right = np.cross(fwd, -up)
+    right = np.cross(fwd, up)  # x right, y down, z forward: right x down = forward
     right = right / np.linalg.norm(right)
     down = np.cross(fwd, right)
     m = np.eye(4)

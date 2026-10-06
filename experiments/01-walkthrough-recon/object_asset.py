@@ -13,7 +13,8 @@ The splats are points sampled evenly over the mesh surface, each a flat disc lyi
 along the face normal) with the base colour and alpha found at that point. The base colour is unlit;
 object_place.py fits a gain and offset to the scene's light. Attention runs on xformers (no flash-attn
 wheels on Windows); TRELLIS.2's background remover is not loaded, since the input already has its alpha.
-Needs access to facebook/dinov3-vitl16-pretrain-lvd1689m (TRELLIS.2's image encoder; approved by hand).
+TRELLIS.2's image encoder is DINOv3 (facebook/dinov3-vitl16-pretrain-lvd1689m, gated); without access it uses
+the same weights converted from timm's ungated copy (dinov3_from_timm.py).
 Run with the TRELLIS.2 environment (.venv-trellis).
 """
 
@@ -53,6 +54,21 @@ except ImportError:
             return lambda *args, **kwargs: None
 
     sys.modules["cumesh"] = types.SimpleNamespace(CuMesh=_NoHoles)
+try:
+    import nvdiffrast.torch  # noqa: E402,F401
+except ImportError:
+    # nvdiffrast (a CUDA rasterizer) isn't installed: o_voxel imports it for its GLB post-processing and TRELLIS.2
+    # for texturing and preview renders, none of which making splats uses. Fail loudly if something does.
+    import types
+
+    class _NoRasterizer(types.ModuleType):
+        def __getattr__(self, name):
+            if name.startswith("__"):  # the import machinery probing, e.g. __path__
+                raise AttributeError(name)
+            raise RuntimeError(f"nvdiffrast isn't installed (nvdiffrast.torch.{name} was called)")
+
+    sys.modules["nvdiffrast"] = types.ModuleType("nvdiffrast")
+    sys.modules["nvdiffrast.torch"] = sys.modules["nvdiffrast"].torch = _NoRasterizer("nvdiffrast.torch")
 import trellis2.pipelines.rembg as rembg  # noqa: E402
 from trellis2.pipelines import Trellis2ImageTo3DPipeline  # noqa: E402
 
@@ -72,6 +88,37 @@ class NoBackgroundRemoval:
 
 
 rembg.BiRefNet = NoBackgroundRemoval
+
+import trellis2.modules.image_feature_extractor as image_features  # noqa: E402
+
+DINOV3 = "facebook/dinov3-vitl16-pretrain-lvd1689m"
+DINOV3_LOCAL = REPO / "tools" / "models" / "dinov3-vitl16-lvd1689m"  # dinov3_from_timm.py
+
+
+class DinoV3Features(image_features.DinoV3FeatureExtractor):
+    """TRELLIS.2's DINOv3 image encoder, two changes: the weights come from dinov3_from_timm.py's conversion of
+    timm's ungated copy when Meta's gated repository isn't accessible (same weights; outputs checked against timm),
+    and the blocks are found where transformers 5 keeps them (model.model.layer, not model.layer)."""
+    def __init__(self, model_name, image_size=512):
+        try:
+            super().__init__(model_name, image_size)
+        except OSError as e:  # gated and not (yet) approved
+            if model_name != DINOV3 or not (DINOV3_LOCAL / "config.json").exists():
+                raise
+            print(f"{model_name} isn't accessible ({type(e).__name__}); using {DINOV3_LOCAL}", flush=True)
+            super().__init__(str(DINOV3_LOCAL), image_size)
+
+    def extract_features(self, image):
+        m = self.model
+        image = image.to(m.embeddings.patch_embeddings.weight.dtype)
+        hidden = m.embeddings(image, bool_masked_pos=None)
+        position = m.rope_embeddings(image)
+        for layer in (m.layer if hasattr(m, "layer") else m.model.layer):
+            hidden = layer(hidden, position_embeddings=position)
+        return F.layer_norm(hidden, hidden.shape[-1:])
+
+
+image_features.DinoV3FeatureExtractor = DinoV3Features
 
 
 def normal_to_quat(n):

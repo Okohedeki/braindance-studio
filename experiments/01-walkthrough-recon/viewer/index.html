@@ -879,6 +879,7 @@ function buildObjectViews() {
 // What imajev answered about an object (identify_objects.py), shortest first.
 function describeObject(o) {
   const a = o.attributes;
+  if (o.replaced) return "replaced from a prompt";
   if (!a || a.skipped) return "";
   const parts = [];
   if (a.material?.value) parts.push(a.material.value);
@@ -899,6 +900,7 @@ function describeObjectLong(o) {
     lines.push(`movable: ${pct(a.movable.p)} · rigid: ${pct(a.rigid.p)} · whole in view: ${pct(a.wholeInView.p)}`);
     lines.push(`classifier: ${a.classifier}`);
   }
+  if (o.replaced) lines.push(`replaced: was a ${o.replaced.was}, now "${o.replaced.prompt}" (Qwen-Image-Edit, TRELLIS.2)`);
   if (o.rebuilt) {
     const v = o.rebuilt.fit.vsRecording;
     lines.push(`rebuilt whole: ${v.reconstructed.psnrInRealMask} -> ${v.rebuilt.psnrInRealMask} dB vs the recording`);

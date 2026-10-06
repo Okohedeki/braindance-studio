@@ -14,7 +14,9 @@ edit was made in, whose camera we know:
     scene), which settles the size a silhouette alone leaves open (smaller and nearer looks the same);
   - a per-channel gain and offset on its colours is fitted to the edited frame, so it takes the scene's
     light; the generated albedo keeps its detail.
-Then the old object's splats leave the scene, the new ones come in under the same object id, flagged 4 in
+Then the old object's splats leave the scene (with every other splat inside its box above a floor layer: a
+completion pass can draw an object whole without labelling it, the labels miss parts of it too, and those would
+poke through the new one), the new ones come in under the same object id, flagged 4 in
 inferred.bin ("replaced from a prompt"), and objects.json records what replaced it.
 
 --self-test uses the old object's own splats as the asset, turned and scaled at random, and its recorded
@@ -124,6 +126,19 @@ def main():
     centre = old["means"].mean(0)
     centre = centre - (centre @ up - floor) * up  # on the floor under the old object
 
+    # splats inside the old object's box that never got its id are the old object too: on the courtyard sofa, 186,601
+    # generated ones (the walk completion drew it whole) and 6,176 recorded ones the labels missed, against 27,945
+    # labelled. All go, except a layer at the floor.
+    flags = (np.frombuffer((src / "inferred.bin").read_bytes(), np.uint8) if (src / "inferred.bin").exists()
+             else np.zeros(len(ids), np.uint8))
+    box = obj["box"]
+    xyz = np.stack([cols["x"], cols["y"], cols["z"]], 1)
+    local = (xyz - np.array(box["center"])) @ np.array(box["axes"]).T
+    o_top = float(torch.quantile(heights, 0.98) - floor)
+    above = xyz @ up.cpu().numpy() - float(floor) > 0.08 * o_top
+    ghost = (np.abs(local) <= np.array(box["half"]) * 1.1).all(1) & above & ~old_sel
+    gone = old_sel | ghost
+
     # target: the new object's mask in the edit frame, at mask resolution
     out_dir = work / "objects" / "replace" / str(args.object)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -169,7 +184,7 @@ def main():
     moge = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl-normal").cuda().eval()
     with torch.no_grad():
         md = moge.infer(edit_t.permute(2, 0, 1), fov_x=math.degrees(2 * math.atan(tw / (2 * float(K[0, 0])))))
-        rest = splats_from_cols(cols, ~old_sel)
+        rest = splats_from_cols(cols, ~gone)
         out_d, a_d, _ = rasterization(rest["means"], rest["quats"], torch.exp(rest["scales"]),
                                       torch.sigmoid(rest["opacities"]), rest["sh0"], viewmat[None], K[None], tw, th,
                                       sh_degree=0, render_mode="RGB+ED", rasterize_mode=mode)
@@ -285,13 +300,59 @@ def main():
         opt.zero_grad()
         loss.backward()
         opt.step()
+    # light: TRELLIS.2 gives albedo, unlit, which looks like a flat cut-out next to a lit scene. Fit one directional
+    # light and an ambient term to the edited frame, then, where that frame saw the surface, take its own colours
+    # (the detail and light the edit drew), fading to the shaded albedo where the surface turns away from it.
     with torch.no_grad():
-        new_rgb = (colours * gain + bias).clamp(0, 1)
+        means, quats, _ = place(yaw, log_s, off, height)
+        w_, x_, y_, z_ = F.normalize(quats, dim=1).unbind(1)
+        normals = torch.stack([2 * (x_ * z_ + w_ * y_), 2 * (y_ * z_ - w_ * x_), 1 - 2 * (x_ * x_ + y_ * y_)], 1)
+        cam = torch.linalg.inv(viewmat)[:3, 3]
+        to_cam = F.normalize(cam - means, dim=1)
+        albedo = (colours * gain + bias).clamp(0, 1)
+    light = (up + to_cam.mean(0)).clone().requires_grad_(True)
+    ambient = torch.full((3,), 0.6, device="cuda", requires_grad=True)
+    diffuse = torch.full((3,), 0.6, device="cuda", requires_grad=True)
+    opt = torch.optim.Adam([light, ambient, diffuse], lr=0.02)
+
+    def shaded():
+        lam = (normals @ F.normalize(light, dim=0)).clamp(min=0)[:, None]
+        return (albedo * (ambient + diffuse * lam)).clamp(0, 1)
+
+    for _ in range(300):
+        img, alpha = render(yaw, log_s, off, height, shaded())
+        m = (target > 0.5) & (alpha > 0.5)
+        lit_l1 = (img[m] - edit_t[m]).abs().mean()
+        opt.zero_grad()
+        lit_l1.backward()
+        opt.step()
+    with torch.no_grad():
+        rgb = shaded()
+        # which splats the edited frame saw: in front of the object's own depth there, inside its (shrunk) mask
+        _, alpha_o, d_o = render(yaw, log_s, off, height, rgb, with_depth=True)
+        pc = means @ viewmat[:3, :3].T + viewmat[:3, 3]
+        z = pc[:, 2].clamp(min=1e-6)
+        u = (pc[:, 0] / z * K[0, 0] + K[0, 2]).round().long()
+        v = (pc[:, 1] / z * K[1, 1] + K[1, 2]).round().long()
+        inside = (pc[:, 2] > 0) & (u >= 0) & (u < tw) & (v >= 0) & (v < th)
+        core = -F.max_pool2d(-target[None, None], 7, stride=1, padding=3)[0, 0] > 0.5  # mask shrunk 3 px
+        uc, vc = u.clamp(0, tw - 1), v.clamp(0, th - 1)
+        seen = inside & core[vc, uc] & (alpha_o[vc, uc] > 0.5) & (z <= d_o[vc, uc] * 1.02)
+        facing = ((normals * to_cam).sum(1).abs() - 0.2).div(0.3).clamp(0, 1) * seen.float()
+        new_rgb = facing[:, None] * edit_t[vc, uc] + (1 - facing[:, None]) * rgb
         img, alpha = render(yaw, log_s, off, height, new_rgb)
+        m = (target > 0.5) & (alpha > 0.5)
+        final_l1 = float((img[m] - edit_t[m]).abs().mean())
     report = {"object": args.object, "frame": f["name"], "iou": round(best["iou"], 3),
               "yawDeg": round(math.degrees(float(yaw)) % 360, 1), "scale": round(math.exp(float(log_s)), 4),
               "colourGain": [round(float(g), 3) for g in gain], "colourBias": [round(float(b), 3) for b in bias],
-              "colourL1": round(float(loss), 4), "depthScale": depth_scale}
+              "colourL1": round(float(loss), 4), "depthScale": depth_scale,
+              "light": {"direction": [round(float(c), 3) for c in F.normalize(light.detach(), dim=0)],
+                        "ambient": [round(float(c), 3) for c in ambient], "diffuse": [round(float(c), 3) for c in diffuse],
+                        "shadedL1": round(float(lit_l1), 4)},
+              "fromEditedFrame": round(float((facing > 0.5).float().mean()), 3), "finalL1": round(final_l1, 4),
+              "removed": {"labelled": int(old_sel.sum()), "generatedInBox": int((ghost & (flags > 0)).sum()),
+                          "recordedInBox": int((ghost & (flags == 0)).sum())}}
     if args.self_test:
         report["selfTest"] = {"trueYawDeg": round(math.degrees(true_yaw) % 360, 1), "trueScale": round(1 / 0.7, 4)}
     sheet = np.concatenate([edit, np.asarray(target.cpu())[..., None].repeat(3, 2),
@@ -309,7 +370,7 @@ def main():
         sh0 = ((new_rgb - 0.5) / SH_C0)[:, None]
     m = len(means)
     names = list(cols)
-    keep = ~old_sel
+    keep = ~gone
     add = {"x": means[:, 0], "y": means[:, 1], "z": means[:, 2], "opacity": asset["opacities"]}
     for i in range(3):
         add[f"f_dc_{i}"] = sh0[:, 0, i]
@@ -325,8 +386,6 @@ def main():
                                                             "trust.json", "coverage.splat"))
     write_ply(out / "scene.ply", new_cols)
     (out / "objects.bin").write_bytes(np.r_[ids[keep], np.full(m, args.object)].astype("<u2").tobytes())
-    flags = (np.frombuffer((src / "inferred.bin").read_bytes(), np.uint8) if (src / "inferred.bin").exists()
-             else np.zeros(len(ids), np.uint8))
     (out / "inferred.bin").write_bytes(np.r_[flags[keep], np.full(m, 4, np.uint8)].astype(np.uint8).tobytes())
     pts_new = means.cpu().numpy()
     c = pts_new.mean(0)
@@ -334,7 +393,8 @@ def main():
     half = np.abs((pts_new - c) @ vt.T).max(0)
     for o in listing["objects"]:
         if o["id"] == args.object:
-            o["replaced"] = {"was": o["label"], "prompt": args.prompt, "editFrame": f["name"], "place": report}
+            o["replaced"] = {"was": o["label"], "prompt": args.prompt, "editFrame": f["name"], "place": report,
+                             "wasAttributes": o.pop("attributes", None)}  # material, mass ... were the old object's
             if args.label:
                 o["label"] = args.label
                 o["name"] = f"{args.label} (replaced)"
